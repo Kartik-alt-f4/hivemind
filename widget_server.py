@@ -137,6 +137,9 @@ async def _run_task(task: str) -> AsyncIterator[dict]:
 
     yield {"type": "status", "text": "planning…"}
 
+    # Snapshot call counts before the run so we can compute per-request deltas
+    calls_before: dict[str, int] = {s["name"]: s["calls"] for s in pool.stats()}
+
     root = AgentNode(task=task, depth=0, max_depth=5)
     semaphore = asyncio.Semaphore(8)
 
@@ -164,29 +167,30 @@ async def _run_task(task: str) -> AsyncIterator[dict]:
     agent_count = len(all_nodes)
     full_text = task + " " + " ".join(n.result for n in all_nodes if n.result)
 
-    # Per-provider call deltas for this request
+    # Per-request deltas (calls this run only, not cumulative)
     stats = pool.stats()
-    per_provider_calls: dict[str, int] = {s["name"]: s["calls"] for s in stats if s["calls"] > 0}
-
-    top_provider = max(stats, key=lambda s: s["calls"], default={"name": "unknown"})
-    tokens_used = METER.add(full_text, top_provider["name"], calls=top_provider.get("calls", 0))
-
-    # Accumulate all providers' call counts into EOD meter
+    per_provider_calls: dict[str, int] = {}
     for s in stats:
-        if s["calls"] > 0 and s["name"] != top_provider["name"]:
-            METER._by_provider_calls[s["name"]] = (
-                METER._by_provider_calls.get(s["name"], 0) + s["calls"]
-            )
+        delta = s["calls"] - calls_before.get(s["name"], 0)
+        if delta > 0:
+            per_provider_calls[s["name"]] = delta
+
+    # Token estimate attributed to top provider by delta calls
+    top = max(per_provider_calls.items(), key=lambda x: x[1], default=("unknown", 0))
+    tokens_used = METER.add(full_text, top[0], calls=top[1])
+    for name, delta in per_provider_calls.items():
+        if name != top[0]:
+            METER._by_provider_calls[name] = METER._by_provider_calls.get(name, 0) + delta
+
+    # Key health snapshot
+    key_health: dict[str, list[dict]] = {
+        s["name"]: s["key_status"]
+        for s in stats
+        if "key_status" in s
+    }
 
     yield {"type": "status", "text": f"done — {agent_count} agent(s)"}
-    yield {"type": "result", "text": result_text}
-    # Build per-provider key health summary
-    key_health: dict[str, list[dict]] = {}
-    for s in stats:
-        name = s["name"]
-        if "key_status" in s:
-            key_health[name] = s["key_status"]
-
+    # Send usage BEFORE result so the widget has stats when the result bubble is added
     yield {
         "type": "usage",
         "agents": agent_count,
@@ -195,6 +199,7 @@ async def _run_task(task: str) -> AsyncIterator[dict]:
         "tokens": METER.snapshot(),
         "key_health": key_health,
     }
+    yield {"type": "result", "text": result_text}
 
 # ── POST /chat — HTTP streaming ───────────────────────────────────────────────
 @app.post("/chat")
