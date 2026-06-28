@@ -1,0 +1,414 @@
+════════════════════════════════════════════════════════
+  SUMMARY
+════════════════════════════════════════════════════════
+  Provider       Status   Latency    Model
+  ────────────── ──────── ────────── ────────────────────
+  Gemini         ✓ OK     0.5s       gemini-3.1-flash-lite
+  Groq           ✓ OK     0.2s       llama-3.3-70b-versatile
+  OpenRouter     skip      —           —
+  Ollama         skip      —           —
+
+  All 2 configured provider(s) working.
+
+  Tip: run individual tests for more detail, e.g. python tests/test_groq.py
+
+
+⬡ HiveMind
+  ✓ Python 3.14.6
+  ✓ .env found
+  ✓ Dependencies satisfied
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│    ⬡ HIVEMIND                                                                                                                                                        │
+│    Recursive Agent Cluster                                                                                                                                           │
+│    ─────────────────────────────                                                                                                                                     │
+│    Any OpenAI-compatible backend · Dynamic task splitting                                                                                                            │
+│    Key rotation · Parallel execution · Live tree view                                                                                                                │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Loaded 2 provider(s): GEMINI, GROQ
+
+[03:09:40] [38df08] depth=0 budget=29 | ##SOLVE##
+2+2 = 4
+[03:09:40] [38df08] SOLVED depth=0
+╭───────────────────────────────────────────────────────────── ⬡ HIVEMIND agent cluster  ✓ Complete  0.6s ─────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│  "what is 2+2"                                                                                                                                                       │
+│  └── ● [38df08] what is 2+2  0.6s                                                          agents   1                                                                │
+│                                                                                            done     1                                                                │
+│                                                                                            active   0                                                                │
+│                                                                                            errors   0                                                                │
+│                                                                                                                                                                      │
+│                                                                                            gemini   1 calls / 0 err                                                  │
+│                                                                                            groq     0 calls / 0 err                                                  │
+│                                                                                                                                                                      │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+  gemini     1 calls  0 errors  (1 requests this session)
+  groq       0 calls  0 errors  (0 requests this session)
+  Note: Gemini Flash Lite free tier ~1500 req/day · Groq free tier ~14400 req/day
+
+
+╭─────────────────────────────────────────────────────────────────────────── ✓ Final Answer ───────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│  2+2 = 4                                                                                                                                                             │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+Total agents: 1  |  Time: 0.6s  |  API calls: 1
+
+
+⬡ HiveMind
+  ✓ Python 3.14.6
+  ✓ .env found
+  ✓ Dependencies satisfied
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│    ⬡ HIVEMIND                                                                                                                                                        │
+│    Recursive Agent Cluster                                                                                                                                           │
+│    ─────────────────────────────                                                                                                                                     │
+│    Any OpenAI-compatible backend · Dynamic task splitting                                                                                                            │
+│    Key rotation · Parallel execution · Live tree view                                                                                                                │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Loaded 2 provider(s): GEMINI, GROQ
+
+[03:09:43] [0cc6ea] depth=0 budget=29 | ##SPLIT##
+- Explain the "Attention Mechanism" (specifically Scaled Dot-Product Attention and Multi-Head Attention) and h
+[03:09:43] [0cc6ea] SPLIT into 3 | registry=4/30
+[03:09:46] [0816af] depth=1 budget=26 | ##SOLVE##
+
+In a Transformer architecture, the core mechanism—**Self-Attention**—is inherently "permutation-invariant." T
+[03:09:46] [0816af] SOLVED depth=1
+[03:09:48] [c037ec] depth=1 budget=26 | ##SOLVE##
+
+To understand why Transformers have largely superseded RNNs and LSTMs, we must look at the fundamental archit
+[03:09:48] [c037ec] SOLVED depth=1
+[03:09:52] [8f1385] depth=1 budget=26 | ##SOLVE##
+
+The Attention Mechanism is the core innovation of the Transformer architecture, enabling it to model dependen
+[03:09:52] [8f1385] SOLVED depth=1
+╭──────────────────────────────────────────────────────────── ⬡ HIVEMIND agent cluster  ✓ Complete  15.4s ─────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│  "explain how transformers work in machine learning, cover attention mechanism, positional encoding, and why they replaced RNNs"                                     │
+│  ├── ● [8f1385] Explain the "Attention Mechanism" (specifically Scaled Dot-P…  8.9s                                                     agents   4                   │
+│  ├── ● [0816af] Explain the role of "Positional Encoding" in transformers, d…  2.7s                                                     done     4                   │
+│  └── ● [c037ec] Compare Transformers vs. RNNs/LSTMs, focusing on the vanishi…  4.8s                                                     active   0                   │
+│                                                                                                                                         errors   0                   │
+│                                                                                                                                                                      │
+│                                                                                                                                         gemini   5 calls / 0 err     │
+│                                                                                                                                         groq     0 calls / 4 err     │
+│                                                                                                                                                                      │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+  gemini     5 calls  0 errors  (5 requests this session)
+  groq       0 calls  4 errors  (4 requests this session)
+  Note: Gemini Flash Lite free tier ~1500 req/day · Groq free tier ~14400 req/day
+
+
+╭─────────────────────────────────────────────────────────────────────────── ✓ Final Answer ───────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│  Transformers have revolutionized machine learning by fundamentally changing how we process sequential data. By moving away from the sequential constraints of       │
+│  Recurrent Neural Networks (RNNs) and adopting a parallel architecture based on the **Attention Mechanism**, Transformers have become the backbone of modern AI.     │
+│                                                                                                                                                                      │
+│  ### 1. The Core Innovation: The Attention Mechanism                                                                                                                 │
+│  The Transformer’s ability to understand context relies on **Self-Attention**, which allows the model to weigh the importance of different words in a sequence       │
+│  regardless of their distance from one another.                                                                                                                      │
+│                                                                                                                                                                      │
+│  *   **Scaled Dot-Product Attention:** For every word, the model generates three vectors: **Query (Q)** (what it is looking for), **Key (K)** (what it offers), and  │
+│  **Value (V)** (its actual content). By calculating the dot product of $Q$ and $K$, the model determines how much "focus" one word should place on another. These    │
+│  scores are scaled (to maintain stable gradients) and passed through a Softmax function to create a probability distribution, which is then used to weight the       │
+│  Values.                                                                                                                                                             │
+│  *   **Multi-Head Attention:** Instead of one attention calculation, the model runs several in parallel ("heads"). This allows the model to simultaneously capture   │
+│  different types of relationships—for example, one head might focus on grammatical syntax, while another focuses on semantic context.                                │
+│                                                                                                                                                                      │
+│  ### 2. Solving the Order Problem: Positional Encoding                                                                                                               │
+│  Because the attention mechanism processes all words in a sequence simultaneously, it is inherently "permutation-invariant"—it treats the input like a "bag of       │
+│  words" without knowing the order.                                                                                                                                   │
+│                                                                                                                                                                      │
+│  To fix this, Transformers use **Positional Encoding**. By adding a unique, deterministic vector (based on sine and cosine functions) to each input embedding, the   │
+│  model gains a "coordinate system." This allows the model to distinguish between "dog bites man" and "man bites dog" while retaining the speed benefits of parallel  │
+│  processing.                                                                                                                                                         │
+│                                                                                                                                                                      │
+│  ### 3. Why Transformers Replaced RNNs                                                                                                                               │
+│  Before Transformers, RNNs and LSTMs were the standard for sequential data. However, they suffered from critical bottlenecks that Transformers successfully          │
+│  resolved:                                                                                                                                                           │
+│                                                                                                                                                                      │
+│  | Feature | RNNs / LSTMs | Transformers |                                                                                                                           │
+│  | :--- | :--- | :--- |                                                                                                                                              │
+│  | **Processing** | **Sequential:** Must process word $t-1$ before $t$. | **Parallel:** Processes the entire sequence at once. |                                     │
+│  | **Gradient Flow** | **Vanishing Gradient:** Hard to learn long-range dependencies. | **Stable:** Direct paths between all tokens ($O(1)$ path length). |          │
+│  | **Context** | **Bottleneck:** Information fades over long sequences. | **Global:** Every token can "see" every other token directly. |                            │
+│  | **Training** | **Slow:** Cannot fully utilize GPU parallelization. | **Fast:** Highly efficient matrix operations. |                                              │
+│                                                                                                                                                                      │
+│  #### Key Advantages:                                                                                                                                                │
+│  *   **Elimination of the Vanishing Gradient:** In RNNs, gradients must propagate through every step of a sequence, often causing them to "vanish" or "explode."     │
+│  Transformers provide a direct path between any two tokens, ensuring stable gradient flow even over very long documents.                                             │
+│  *   **Superior Long-Range Dependency Handling:** Because Transformers do not rely on a hidden state to "carry" information forward, they do not suffer from the     │
+│  information loss inherent in RNNs. A token at the end of a book can directly attend to a token at the very beginning.                                               │
+│  *   **Computational Efficiency:** By removing the requirement to process data step-by-step, Transformers can leverage the massive parallel processing power of      │
+│  modern GPUs. This scalability is the primary reason we can train models on the entire internet, a feat that was computationally impossible with the sequential      │
+│  nature of RNNs.                                                                                                                                                     │
+│                                                                                                                                                                      │
+│  ### Summary                                                                                                                                                         │
+│  The Transformer architecture succeeds by replacing the rigid, sequential processing of RNNs with a flexible, parallel mechanism. By using **Multi-Head Attention**  │
+│  to capture complex relationships and **Positional Encoding** to maintain sequence order, Transformers provide a faster, more stable, and more context-aware         │
+│  framework that has become the foundation for all modern Large Language Models.                                                                                      │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+Total agents: 4  |  Time: 15.4s  |  API calls: 5
+
+
+⬡ HiveMind
+  ✓ Python 3.14.6
+  ✓ .env found
+  ✓ Dependencies satisfied
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│    ⬡ HIVEMIND                                                                                                                                                        │
+│    Recursive Agent Cluster                                                                                                                                           │
+│    ─────────────────────────────                                                                                                                                     │
+│    Any OpenAI-compatible backend · Dynamic task splitting                                                                                                            │
+│    Key rotation · Parallel execution · Live tree view                                                                                                                │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Loaded 2 provider(s): GEMINI, GROQ
+
+[03:10:00] [56f92b] depth=0 budget=29 | ##CLARIFY##
+Please provide the specific item, code, document, or situation that requires fixing.
+╭───────────────────────────────────────────────────────────── ⬡ HIVEMIND agent cluster  ✓ Complete  0.6s ─────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│  "fix it"                                                                                                                                                            │
+│  └── ✗ [56f92b] fix it  0.6s                                                        agents   1                                                                       │
+│                                                                                     done     0                                                                       │
+│                                                                                     active   0                                                                       │
+│                                                                                     errors   1                                                                       │
+│                                                                                                                                                                      │
+│                                                                                     gemini   1 calls / 0 err                                                         │
+│                                                                                     groq     0 calls / 0 err                                                         │
+│                                                                                                                                                                      │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+  gemini     1 calls  0 errors  (1 requests this session)
+  groq       0 calls  0 errors  (0 requests this session)
+  Note: Gemini Flash Lite free tier ~1500 req/day · Groq free tier ~14400 req/day
+
+
+╭─────────────────────────────────────────────────────────────────────── ⚠ Needs Clarification ────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│  Please provide the specific item, code, document, or situation that requires fixing.                                                                                │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+Total agents: 1  |  Time: 0.6s  |  API calls: 1
+
+
+⬡ HiveMind
+  ✓ Python 3.14.6
+  ✓ .env found
+  ✓ Dependencies satisfied
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│    ⬡ HIVEMIND                                                                                                                                                        │
+│    Recursive Agent Cluster                                                                                                                                           │
+│    ─────────────────────────────                                                                                                                                     │
+│    Any OpenAI-compatible backend · Dynamic task splitting                                                                                                            │
+│    Key rotation · Parallel execution · Live tree view                                                                                                                │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Loaded 2 provider(s): GEMINI, GROQ
+
+[03:10:03] [1ac926] depth=0 budget=29 | ##SPLIT##
+- Calculate the snail's net progress per hour, accounting for the specific rule that every 3rd hour it only cl
+[03:10:03] [1ac926] SPLIT into 2 | registry=3/30
+[03:10:03] [1ac926] SEQUENTIAL mode — subtask dependencies detected
+[03:10:06] [223afd] depth=1 budget=27 | ##SOLVE##
+
+To determine when the snail reaches the top (step 30), we track its position at the end of each hour. The sna
+[03:10:06] [223afd] SOLVED depth=1
+[03:10:10] [319dd1] depth=1 budget=27 | ##SOLVE##
+
+To determine when the snail reaches the top (30 steps), we track its position hour by hour. Note: If the snai
+[03:10:10] [319dd1] SOLVED depth=1
+╭──────────────────────────────────────────────────────────── ⬡ HIVEMIND agent cluster  ✓ Complete  12.4s ─────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│  "A snail starts at the bottom of a 30-step staircase. Every hour it climbs 5 steps but slides back 2. On every 3rd hour it only climbs 3 steps before sliding back  │
+│  2. What hour does it reach the top and what step is it on at the end of each hour?"                                                                                 │
+│  ├── ● [223afd] Calculate the snail's net progress per hour, accounting for …  3.8s                                                                                  │
+│  └── ● [319dd1] Create a step-by-step table tracking the snail's position at…  3.7s                                                                                  │
+│                                                                                                                                                                      │
+│    agents   3                                                                                                                                                        │
+│    done     3                                                                                                                                                        │
+│    active   0                                                                                                                                                        │
+│    errors   0                                                                                                                                                        │
+│                                                                                                                                                                      │
+│    gemini   4 calls / 0 err                                                                                                                                          │
+│    groq     0 calls / 3 err                                                                                                                                          │
+│                                                                                                                                                                      │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+  gemini     4 calls  0 errors  (4 requests this session)
+  groq       0 calls  3 errors  (3 requests this session)
+  Note: Gemini Flash Lite free tier ~1500 req/day · Groq free tier ~14400 req/day
+
+
+╭─────────────────────────────────────────────────────────────────────────── ✓ Final Answer ───────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│  To determine when the snail reaches the top of the 30-step staircase, we must account for the specific climbing rules: a net gain of 3 steps on standard hours      │
+│  (climb 5, slide 2) and a net gain of 1 step on every 3rd hour (climb 3, slide 2). Crucially, the snail finishes the task the moment its upward climb reaches or     │
+│  exceeds the 30th step, before the slide occurs.                                                                                                                     │
+│                                                                                                                                                                      │
+│  ### Hour-by-Hour Progress Table                                                                                                                                     │
+│                                                                                                                                                                      │
+│  | Hour | Start Position | Climb | Peak (During Hour) | Slide | End Position |                                                                                       │
+│  | :--- | :--- | :--- | :--- | :--- | :--- |                                                                                                                         │
+│  | 1 | 0 | +5 | 5 | -2 | 3 |                                                                                                                                         │
+│  | 2 | 3 | +5 | 8 | -2 | 6 |                                                                                                                                         │
+│  | 3 | 6 | +3 | 9 | -2 | 7 |                                                                                                                                         │
+│  | 4 | 7 | +5 | 12 | -2 | 10 |                                                                                                                                       │
+│  | 5 | 10 | +5 | 15 | -2 | 13 |                                                                                                                                      │
+│  | 6 | 13 | +3 | 16 | -2 | 14 |                                                                                                                                      │
+│  | 7 | 14 | +5 | 19 | -2 | 17 |                                                                                                                                      │
+│  | 8 | 17 | +5 | 22 | -2 | 20 |                                                                                                                                      │
+│  | 9 | 20 | +3 | 23 | -2 | 21 |                                                                                                                                      │
+│  | 10 | 21 | +5 | 26 | -2 | 24 |                                                                                                                                     │
+│  | 11 | 24 | +5 | 29 | -2 | 27 |                                                                                                                                     │
+│  | 12 | 27 | +3 | **30** | - | **30 (Reached)** |                                                                                                                    │
+│                                                                                                                                                                      │
+│  ### Conclusion                                                                                                                                                      │
+│  The snail reaches the top of the staircase during the **12th hour**.                                                                                                │
+│                                                                                                                                                                      │
+│  While the snail ends the 11th hour at step 27, it begins the 12th hour (a "3rd hour" rule) by climbing 3 steps. Since 27 + 3 = 30, it touches the top of the        │
+│  staircase during this climb and does not slide back.                                                                                                                │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+Total agents: 3  |  Time: 12.4s  |  API calls: 4
+
+
+⬡ HiveMind
+  ✓ Python 3.14.6
+  ✓ .env found
+  ✓ Dependencies satisfied
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│    ⬡ HIVEMIND                                                                                                                                                        │
+│    Recursive Agent Cluster                                                                                                                                           │
+│    ─────────────────────────────                                                                                                                                     │
+│    Any OpenAI-compatible backend · Dynamic task splitting                                                                                                            │
+│    Key rotation · Parallel execution · Live tree view                                                                                                                │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Loaded 2 provider(s): GEMINI, GROQ
+
+[03:10:17] [4d4120] depth=0 budget=29 | ##SPLIT##
+- [Legal and Financial Foundation: Guide the user through selecting a legal structure (C-Corp vs LLC), intelle
+[03:10:17] [4d4120] SPLIT into 3 | registry=4/30
+[03:10:20] [3720dc] depth=1 budget=26 | ##SOLVE##
+
+### 1. Software Development Lifecycle (SDLC)
+For a startup, the traditional Waterfall model is too rigid. Ado
+[03:10:20] [3720dc] SOLVED depth=1
+[03:10:23] [b73fd2] depth=1 budget=26 | ##SOLVE##
+
+### 1. Legal Structure: C-Corp vs. LLC
+The choice of entity dictates your tax treatment, liability protection
+[03:10:23] [b73fd2] SOLVED depth=1
+[03:10:27] [dce8a7] depth=1 budget=26 | ##SOLVE##
+
+### Go-to-Market (GTM) and Growth Strategy
+
+Building a successful software company requires transitioning fro
+[03:10:27] [dce8a7] SOLVED depth=1
+╭──────────────────────────────────────────────────────────── ⬡ HIVEMIND agent cluster  ✓ Complete  17.4s ─────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│  "write a comprehensive guide to starting a software company: legal structure, hiring, product development, fundraising, and go-to-market strategy"                  │
+│  ├── ● [b73fd2] [Legal and Financial Foundation: Guide the user through sele…  5.6s                                                                                  │
+│  ├── ● [3720dc] [Product Development and Engineering: Outline the software d…  3.1s                                                                                  │
+│  └── ● [dce8a7] [Go-to-Market and Growth Strategy: Detail how to build a sal…  9.8s                                                                                  │
+│                                                                                                                                                                      │
+│    agents   4                                                                                                                                                        │
+│    done     4                                                                                                                                                        │
+│    active   0                                                                                                                                                        │
+│    errors   0                                                                                                                                                        │
+│                                                                                                                                                                      │
+│    gemini   5 calls / 0 err                                                                                                                                          │
+│    groq     0 calls / 4 err                                                                                                                                          │
+│                                                                                                                                                                      │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+  gemini     5 calls  0 errors  (5 requests this session)
+  groq       0 calls  4 errors  (4 requests this session)
+  Note: Gemini Flash Lite free tier ~1500 req/day · Groq free tier ~14400 req/day
+
+
+╭─────────────────────────────────────────────────────────────────────────── ✓ Final Answer ───────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                      │
+│  Starting a software company is a multi-disciplinary challenge that requires balancing legal rigor, technical agility, and market-driven growth. This guide          │
+│  integrates the foundational pillars of building a successful venture.                                                                                               │
+│                                                                                                                                                                      │
+│  ---                                                                                                                                                                 │
+│                                                                                                                                                                      │
+│  ### I. Legal and Financial Foundation                                                                                                                               │
+│  Your company’s structure is the bedrock upon which all future investment and ownership are built.                                                                   │
+│                                                                                                                                                                      │
+│  *   **Entity Selection:** For high-growth startups, the **Delaware C-Corp** is the industry standard. It is the only structure institutional investors (VCs) will   │
+│  accept, and it allows for the issuance of preferred stock and QSBS tax benefits. Avoid LLCs if you intend to raise venture capital.                                 │
+│  *   **IP Ownership:** Ensure the company owns your work. Every founder and contractor must sign an **IP Assignment Agreement**. Without this, your company has no   │
+│  proprietary value.                                                                                                                                                  │
+│  *   **Founder Equity & Taxes:**                                                                                                                                     │
+│      *   **Vesting:** Implement a 4-year vesting schedule with a 1-year cliff for all founders to protect the company if a partner leaves.                           │
+│      *   **83(b) Election:** File this with the IRS within 30 days of receiving your stock to avoid massive personal tax liabilities.                                │
+│  *   **Fundraising:** Treat fundraising as a sales process. Use **SAFEs (Simple Agreements for Future Equity)** for early-stage rounds; they are faster and more     │
+│  founder-friendly than priced equity rounds or convertible notes. Aim to sell 10–20% of the company in a Seed round.                                                 │
+│                                                                                                                                                                      │
+│  ### II. Product Development and Engineering                                                                                                                         │
+│  The goal of early-stage development is **validated learning**, not feature completeness.                                                                            │
+│                                                                                                                                                                      │
+│  *   **MVP Methodology:** Build the smallest version of your product that solves the core problem. Use the **Build-Measure-Learn** loop: build the feature, measure  │
+│  user interaction, and learn whether to pivot or persevere. Avoid "feature creep" that doesn't serve your primary metric.                                            │
+│  *   **Tech Stack:** Prioritize velocity. Use proven, well-supported stacks like **React/Next.js** for the frontend and **Node.js or Python** for the backend. Use   │
+│  managed cloud services (AWS/GCP) to minimize DevOps overhead.                                                                                                       │
+│  *   **Engineering Culture:** Hire "T-shaped" generalists who prioritize product outcomes over code purity. Use practical, time-boxed take-home assignments rather   │
+│  than abstract whiteboard puzzles to assess talent.                                                                                                                  │
+│                                                                                                                                                                      │
+│  ### III. Go-to-Market (GTM) and Growth                                                                                                                              │
+│  You cannot scale until you have achieved **Product-Market Fit (PMF)**. Scaling a "leaky bucket" (where users churn faster than they arrive) is a recipe for         │
+│  failure.                                                                                                                                                            │
+│                                                                                                                                                                      │
+│  *   **Defining PMF:** Look for "pull" rather than "push." A strong quantitative signal is the "Sean Ellis Test": if >40% of users would be "very disappointed"      │
+│  without your product, you have achieved PMF.                                                                                                                        │
+│  *   **The Sales Funnel:**                                                                                                                                           │
+│      *   **Top:** Educate the market on the *problem* via content and SEO.                                                                                           │
+│      *   **Middle:** Capture leads with high-value assets (webinars, free tools).                                                                                    │
+│      *   **Bottom:** Convert via frictionless trials or demos.                                                                                                       │
+│  *   **Growth Strategy:**                                                                                                                                            │
+│      *   **Product-Led Growth (PLG):** Build virality into the product (e.g., referral loops, collaborative features).                                               │
+│      *   **Sales-Led Growth (SLG):** If targeting enterprise clients, use Account-Based Marketing (ABM) to conduct targeted, high-touch outreach.                    │
+│  *   **Metrics:** Monitor your **LTV:CAC ratio**. A healthy business maintains a Lifetime Value (LTV) at least 3x higher than the Customer Acquisition Cost (CAC).   │
+│                                                                                                                                                                      │
+│  ### IV. The Founder’s Checklist: Summary                                                                                                                            │
+│  1.  **Incorporate:** Form a Delaware C-Corp.                                                                                                                        │
+│  2.  **Protect:** Execute IP assignments and file your 83(b) election.                                                                                               │
+│  3.  **Build:** Develop an MVP using an Agile framework; focus on the core value proposition.                                                                        │
+│  4.  **Validate:** Test for PMF using user feedback and retention metrics.                                                                                           │
+│  5.  **Fund:** Use SAFEs to raise capital; maintain transparency with investors through monthly updates.                                                             │
+│  6.  **Scale:** Once you have a repeatable, profitable funnel, increase spend on the channels with the highest ROAS.                                                 │
+│                                                                                                                                                                      │
+│  **Final Advice:** In the early stages, **speed is your greatest competitive advantage.** Focus on the intersection of what you build well, what the market          │
+│  desperately needs, and what you can sell profitably.                                                                                                                │
+│                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+Total agents: 4  |  Time: 17.4s  |  API calls: 5
