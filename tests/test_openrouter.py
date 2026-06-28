@@ -179,7 +179,7 @@ async def test_json_compliance(key: str):
         err(f"Not valid JSON: {e}")
         info("Model is not JSON-compliant — may need prompt tuning")
 
-async def test_speed(key: str):
+async def test_speed(key: str) -> float | None:
     hdr("6. Speed test (3 calls)")
     times = []
     for i in range(3):
@@ -190,7 +190,10 @@ async def test_speed(key: str):
         else:
             err(f"Call {i+1} failed: {result['status']}")
     if times:
-        info(f"Avg latency: {sum(times)/len(times):.2f}s")
+        avg = sum(times) / len(times)
+        info(f"Avg latency: {avg:.2f}s")
+        return avg
+    return None
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
@@ -211,7 +214,7 @@ async def main():
     avg_latency = None
     if auth_ok:
         await test_json_compliance(key)
-        await test_speed(key)
+        avg_latency = await test_speed(key)
 
         if len(KEYS) > 1:
             hdr(f"7. Testing remaining {len(KEYS)-1} key(s)")

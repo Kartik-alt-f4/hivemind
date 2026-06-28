@@ -155,7 +155,7 @@ async def test_json_compliance(key: str):
         err(f"Not valid JSON: {e}")
         info("Smaller local models may not follow JSON instructions reliably")
 
-async def test_speed(key: str):
+async def test_speed(key: str) -> float | None:
     hdr("6. Speed test (3 calls)")
     times = []
     for i in range(3):
@@ -170,6 +170,8 @@ async def test_speed(key: str):
         info(f"Avg latency: {avg:.2f}s")
         if avg > 10:
             info("Tip: GPU acceleration speeds up Ollama significantly — check 'ollama ps'")
+        return avg
+    return None
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
@@ -189,7 +191,7 @@ async def main():
     avg_latency = None
     if auth_ok:
         await test_json_compliance(key)
-        await test_speed(key)
+        avg_latency = await test_speed(key)
 
     print(f"\n{YLW}── Summary{RST}")
     if auth_ok:
