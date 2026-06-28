@@ -76,11 +76,12 @@ class Provider:
     def key_status(self) -> list[dict]:
         return [
             {
+                "label": f"{self.name.lower()}{i + 1}",
                 "key_suffix": k.value[-6:],
                 "calls": k.calls,
                 "rate_limited": k.rate_limited,
             }
-            for k in self.api_keys
+            for i, k in enumerate(self.api_keys)
         ]
 
 

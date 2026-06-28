@@ -108,15 +108,20 @@ def _print_result(text: str):
         print(text)
 
 
-def _print_stats(agents: int, per_provider: dict, tokens: int, key_health: dict):
-    parts = []
-    for prov, calls in per_provider.items():
-        keys = key_health.get(prov, [])
-        ok = sum(1 for k in keys if not k.get("rate_limited"))
-        total = len(keys)
-        key_str = f" [{ok}/{total} keys]" if total else ""
-        parts.append(f"{prov.lower()}:{calls}{key_str}")
-    summary = "  ".join(parts)
+def _print_stats(agents: int, per_key: dict, tokens: int, key_health: dict):
+    # Show per-key usage: gemini1:2  gemini2:1  groq1:3
+    # Rate-limited keys get a ! suffix
+    limited: set[str] = set()
+    for keys in key_health.values():
+        for k in keys:
+            if k.get("rate_limited"):
+                limited.add(k["label"])
+
+    parts = [
+        f"{label}:{calls}{'!' if label in limited else ''}"
+        for label, calls in sorted(per_key.items())
+    ]
+    summary = "  ".join(parts) if parts else "—"
     msg = f"⬡ {agents} agent{'s' if agents != 1 else ''}  {summary}  ~{tokens} tok"
     if _RICH:
         console.print(f"[dim]{msg}[/dim]")
@@ -205,7 +210,7 @@ def run_task(task: str, history: list[dict]) -> str | None:
         s = stats_data[0]
         _print_stats(
             agents=s.get("agents", 0),
-            per_provider=s.get("per_provider_calls", {}),
+            per_key=s.get("per_key_calls", {}),
             tokens=s.get("tokens_this_msg", 0),
             key_health=s.get("key_health", {}),
         )

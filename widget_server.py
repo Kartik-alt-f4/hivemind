@@ -138,7 +138,14 @@ async def _run_task(task: str) -> AsyncIterator[dict]:
     yield {"type": "status", "text": "planning…"}
 
     # Snapshot call counts before the run so we can compute per-request deltas
-    calls_before: dict[str, int] = {s["name"]: s["calls"] for s in pool.stats()}
+    _pre = pool.stats()
+    calls_before: dict[str, int] = {s["name"]: s["calls"] for s in _pre}
+    # per-key: keyed by label (e.g. "gemini1")
+    key_calls_before: dict[str, int] = {
+        k["label"]: k["calls"]
+        for s in _pre if "key_status" in s
+        for k in s["key_status"]
+    }
 
     root = AgentNode(task=task, depth=0, max_depth=5)
     semaphore = asyncio.Semaphore(8)
@@ -182,7 +189,15 @@ async def _run_task(task: str) -> AsyncIterator[dict]:
         if name != top[0]:
             METER._by_provider_calls[name] = METER._by_provider_calls.get(name, 0) + delta
 
-    # Key health snapshot
+    # Per-key call deltas for this request (e.g. {"gemini1": 2, "groq1": 1})
+    per_key_calls: dict[str, int] = {}
+    for s in stats:
+        for k in s.get("key_status", []):
+            delta = k["calls"] - key_calls_before.get(k["label"], 0)
+            if delta > 0:
+                per_key_calls[k["label"]] = delta
+
+    # Key health snapshot (full status for rate-limit display)
     key_health: dict[str, list[dict]] = {
         s["name"]: s["key_status"]
         for s in stats
@@ -195,6 +210,7 @@ async def _run_task(task: str) -> AsyncIterator[dict]:
         "type": "usage",
         "agents": agent_count,
         "per_provider_calls": per_provider_calls,
+        "per_key_calls": per_key_calls,
         "tokens_this_msg": tokens_used,
         "tokens": METER.snapshot(),
         "key_health": key_health,
