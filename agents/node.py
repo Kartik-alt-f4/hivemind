@@ -1,8 +1,7 @@
 """
-Agent Node - the recursive unit of the HiveMind tree.
-Marker-based planning: ##SPLIT##, ##SOLVE##, ##CLARIFY##
-Budget enforced BEFORE child instantiation to prevent explosions.
-Ray integration: parallel subtasks run in separate processes when Ray is available.
+Agent Node — recursive unit of the HiveMind cluster.
+Markers: ##SPLIT##, ##SOLVE##, ##CLARIFY##
+Project tasks get a shared workspace .md file all agents read/write.
 """
 import asyncio
 import re
@@ -21,8 +20,6 @@ try:
 except ImportError:
     _RAY_AVAILABLE = False
 
-# Minimum fan-out to justify Ray process startup overhead (~10-15s per worker).
-# Below this threshold, asyncio.gather is faster.
 RAY_THRESHOLD = 4
 
 
@@ -34,18 +31,59 @@ def _debug_log(msg: str):
 
 
 class AgentStatus(Enum):
-    PENDING   = "pending"
-    PLANNING  = "planning"
-    RUNNING   = "running"
-    MERGING   = "merging"
-    DONE      = "done"
-    ERROR     = "error"
+    PENDING  = "pending"
+    PLANNING = "planning"
+    RUNNING  = "running"
+    MERGING  = "merging"
+    DONE     = "done"
+    ERROR    = "error"
 
 
-# Global registry — budget enforced here
 _agent_registry: dict[str, "AgentNode"] = {}
 MAX_TOTAL_AGENTS = 30
 
+
+# ── Workspace helpers ─────────────────────────────────────────────────────────
+
+def _workspace_path(root_task: str) -> pathlib.Path:
+    slug = re.sub(r"[^a-z0-9]+", "_", root_task.lower())[:48].strip("_")
+    ws = pathlib.Path("hivemind_workspace")
+    ws.mkdir(exist_ok=True)
+    return ws / f"{slug}.md"
+
+
+def _read_workspace(path: pathlib.Path) -> str:
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        return ""
+
+
+def _write_workspace(path: pathlib.Path, content: str):
+    path.write_text(content)
+
+
+def _append_workspace(path: pathlib.Path, section: str, content: str):
+    existing = _read_workspace(path)
+    entry = f"\n\n## {section}\n\n{content}"
+    _write_workspace(path, existing + entry)
+
+
+# ── Task type detection ───────────────────────────────────────────────────────
+
+_PROJECT_HINTS = re.compile(
+    r"\b(build|create|write|implement|design|generate|make|produce|develop|draft|"
+    r"plan|outline|code|script|report|document|file|project|deliverable|setup|"
+    r"refactor|migrate|analyse|analyze|research)\b",
+    re.IGNORECASE,
+)
+
+def _is_project_task(task: str) -> bool:
+    """True if the task expects a concrete deliverable rather than a conversational answer."""
+    return bool(_PROJECT_HINTS.search(task)) and len(task.split()) > 6
+
+
+# ── Agent Node ────────────────────────────────────────────────────────────────
 
 @dataclass
 class AgentNode:
@@ -53,7 +91,7 @@ class AgentNode:
     depth: int = 0
     parent_id: Optional[str] = None
     agent_id: str = field(default_factory=lambda: uuid.uuid4().hex[:6])
-    root_task: str = ""  # original root objective, propagated to all descendants
+    root_task: str = ""
 
     status: AgentStatus = AgentStatus.PENDING
     children: list["AgentNode"] = field(default_factory=list)
@@ -66,10 +104,18 @@ class AgentNode:
     min_complexity: int = 3
     on_update: Optional[Callable] = None
 
+    # Set by root node, propagated to children
+    is_project: bool = False
+    workspace_path: Optional[pathlib.Path] = None
+
     def __post_init__(self):
         _agent_registry[self.agent_id] = self
         if not self.root_task:
-            self.root_task = self.task  # root node seeds its own task
+            self.root_task = self.task
+        if self.depth == 0:
+            self.is_project = _is_project_task(self.task)
+            if self.is_project:
+                self.workspace_path = _workspace_path(self.root_task)
 
     def _emit(self):
         if self.on_update:
@@ -98,7 +144,6 @@ class AgentNode:
             if subtasks and self.depth < self.max_depth:
                 await self._split_and_merge(subtasks, semaphore)
             else:
-                # Clarify gate (root only)
                 if self.depth == 0 and "##CLARIFY##" in response:
                     clarification = response.split("##CLARIFY##", 1)[1].strip()
                     self.status = AgentStatus.ERROR
@@ -108,11 +153,9 @@ class AgentNode:
                     self.ended_at = time.time()
                     return clarification
 
-                # Extract answer
                 if "##SOLVE##" in response:
                     answer = response.split("##SOLVE##", 1)[1].strip()
                 elif "##SPLIT##" in response:
-                    # Wanted to split but no valid subtasks parsed — solve instead
                     answer = await self._force_solve()
                 else:
                     answer = response.strip()
@@ -120,6 +163,11 @@ class AgentNode:
                         if label in answer:
                             answer = answer.split(label, 1)[1].strip()
                             break
+
+                # Write result to workspace if project task
+                if self.workspace_path and answer:
+                    label = f"Agent {self.agent_id} (depth {self.depth})"
+                    _append_workspace(self.workspace_path, label, answer)
 
                 _debug_log(f"[{self.agent_id}] SOLVED depth={self.depth}")
                 self.result = answer
@@ -138,11 +186,15 @@ class AgentNode:
         return None
 
     async def _force_solve(self) -> str:
-        system = "You are a focused AI agent. Answer the task directly and completely."
+        ws_context = ""
+        if self.workspace_path:
+            existing = _read_workspace(self.workspace_path)
+            if existing:
+                ws_context = f"\n\nWorkspace so far:\n{existing[-2000:]}"
         return await chat(
-            [{"role": "user", "content": f"Task: {self.task}\n\nSolve this completely."}],
-            system=system, temperature=0.5, max_tokens=2048,
-            depth=self.depth,
+            [{"role": "user", "content": f"Task: {self.task}\n\nSolve this completely.{ws_context}"}],
+            system="You are a HiveMind agent. Answer the task directly and completely.",
+            temperature=0.5, max_tokens=2048, depth=self.depth,
         )
 
     async def _plan(self) -> str:
@@ -150,56 +202,62 @@ class AgentNode:
             return await self._force_solve()
 
         budget = self._budget()
-        budget_note = (
-            f"\nBUDGET WARNING: Only {budget} agents left globally. Prefer ##SOLVE##."
-            if budget < 8 else ""
-        )
-        clarify_option = (
-            "\n##CLARIFY##\n[one sentence: what exactly is missing]\n"
-            "(Only use if task is a single word/pronoun with zero context)\n"
-            if self.depth == 0 else ""
-        )
 
-        root_context = (
-            ""
-            if self.depth == 0 or self.root_task == self.task
-            else f"\nROOT OBJECTIVE (keep this in mind): {self.root_task}\n"
-        )
-
-        system = (
-            f"You are agent node depth={self.depth}/{self.max_depth} in a recursive multi-agent cluster.\n"
-            + root_context
-            + "\n"
-            + (
-                "You are the ROOT NODE. Your job is to ORCHESTRATE, not to answer.\n"
-                "Split this task into independent workstreams for sub-agents UNLESS it is\n"
-                "genuinely a single atomic question (one fact, one calculation).\n"
-                "When in doubt at depth=0: SPLIT.\n\n"
-                if self.depth == 0 else
-                "ATOMICITY CHECK: Before splitting, ask — is this task a single domain with a single deliverable?\n"
-                "If yes → ##SOLVE## immediately, do not split.\n"
-                "RULE: Split into 2-3 parts only if they are TRULY independent workstreams.\n"
-                "RULE: depth >= 3 → always ##SOLVE## (you're deep enough).\n"
-                "RULE: narrow/specific tasks → always ##SOLVE##.\n"
-                "DEPENDENCY RULE: If any subtask needs another subtask's output, do NOT split — ##SOLVE## instead.\n"
+        # Root node: initialise workspace and detect task type
+        if self.depth == 0 and self.is_project and self.workspace_path:
+            _write_workspace(
+                self.workspace_path,
+                f"# HiveMind Workspace\n\n**Task:** {self.root_task}\n"
+                f"**Started:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
             )
-            + f"{budget_note}\n\n"
-            "OUTPUT — pick exactly one:\n\n"
-            "##SPLIT##\n"
-            "- [self-contained subtask 1 with full context]\n"
-            "- [self-contained subtask 2 with full context]\n"
-            "- [subtask 3 only if truly needed and fully independent]\n\n"
-            "##SOLVE##\n"
-            "[your complete answer here]\n"
-            + clarify_option +
-            "\nOutput ONLY the marker and content. Nothing else."
+
+        # Read workspace context if available
+        ws_context = ""
+        if self.workspace_path:
+            existing = _read_workspace(self.workspace_path)
+            if existing:
+                ws_context = f"\n\nWorkspace:\n{existing[-1500:]}"
+
+        budget_note = (
+            f" BUDGET:{budget} agents left—prefer ##SOLVE##." if budget < 8 else ""
         )
+        root_ctx = (
+            "" if self.depth == 0 or self.root_task == self.task
+            else f"ROOT GOAL: {self.root_task}\n"
+        )
+
+        if self.depth == 0:
+            system = (
+                "You are HiveMind — a recursive multi-agent AI cluster.\n"
+                "You are the ROOT orchestrator. Split complex tasks into independent workstreams.\n"
+                "For simple/conversational tasks, solve directly.\n"
+                + (f"This is a PROJECT task. A workspace file has been created for agents to share work.\n" if self.is_project else "")
+                + budget_note
+            )
+        else:
+            system = (
+                f"You are a HiveMind agent (depth {self.depth}/{self.max_depth}).\n"
+                + root_ctx
+                + "Solve atomically if possible. Split only into 2-3 truly independent parts.\n"
+                + ("depth>=3: always ##SOLVE##.\n" if self.depth >= 3 else "")
+                + budget_note
+            )
+
+        system += (
+            "\n\nRespond with exactly one:\n"
+            "##SPLIT##\n- [subtask 1]\n- [subtask 2]\n\n"
+            "##SOLVE##\n[answer]\n\n"
+            + ("##CLARIFY##\n[one sentence: what is missing]\n" if self.depth == 0 else "")
+            + "Nothing else."
+        )
+
+        user_msg = f"Task: {self.task}{ws_context}"
 
         response = await chat(
-            [{"role": "user", "content": f"Task: {self.task}"}],
+            [{"role": "user", "content": user_msg}],
             system=system,
             temperature=0.3,
-            max_tokens=800,
+            max_tokens=600,
             depth=self.depth,
         )
 
@@ -220,7 +278,6 @@ class AgentNode:
         return subtasks if len(subtasks) >= 2 else []
 
     def _subtasks_have_dependencies(self, subtasks: list[str]) -> bool:
-        """Detect if any subtask references output/result of another subtask by keyword overlap."""
         dep_phrases = re.compile(
             r"\b(result of|output of|based on|using the|after|once|from step|from part)\b",
             re.IGNORECASE,
@@ -234,7 +291,6 @@ class AgentNode:
         self.status = AgentStatus.RUNNING
         self._emit()
 
-        # ── Budget check BEFORE instantiation ──────────────────────────────
         budget = self._budget()
         if budget <= 0:
             _debug_log(f"[{self.agent_id}] BUDGET EXHAUSTED — solving directly")
@@ -247,7 +303,6 @@ class AgentNode:
             _debug_log(f"[{self.agent_id}] BUDGET TRIM {len(subtasks)}→{budget}")
             subtasks = subtasks[:budget]
 
-        # ── Create children (counted here) ──────────────────────────────────
         self.children = [
             AgentNode(
                 task=st,
@@ -257,6 +312,8 @@ class AgentNode:
                 max_depth=self.max_depth,
                 min_complexity=self.min_complexity,
                 on_update=self.on_update,
+                is_project=self.is_project,
+                workspace_path=self.workspace_path,
             )
             for st in subtasks
         ]
@@ -265,7 +322,7 @@ class AgentNode:
 
         sequential = self._subtasks_have_dependencies(subtasks)
         if sequential:
-            _debug_log(f"[{self.agent_id}] SEQUENTIAL mode — subtask dependencies detected")
+            _debug_log(f"[{self.agent_id}] SEQUENTIAL mode")
             for child in self.children:
                 await child.run(semaphore)
         elif _RAY_AVAILABLE and len(subtasks) >= RAY_THRESHOLD:
@@ -281,16 +338,11 @@ class AgentNode:
         self._emit()
 
     async def _run_children_ray(self, semaphore: asyncio.Semaphore):
-        """Dispatch all children as Ray remote tasks (true multi-process parallelism)."""
         budget_per_child = max(1, self._budget() // len(self.children))
         refs = [
             _ray_run_subtask.remote(
-                child.task,
-                child.depth,
-                child.root_task,
-                child.max_depth,
-                child.min_complexity,
-                budget_per_child,
+                child.task, child.depth, child.root_task,
+                child.max_depth, child.min_complexity, budget_per_child,
             )
             for child in self.children
         ]
@@ -299,14 +351,14 @@ class AgentNode:
         loop = asyncio.get_event_loop()
         payloads = await loop.run_in_executor(None, ray.get, refs)
 
-        # Patch worker provider stats back into this process's pool
         from core.providers import get_pool
         pool = get_pool()
         provider_map = {p.name: p for p in pool.providers}
         for result, worker_stats in payloads:
             for name, (calls, errors) in worker_stats.items():
                 if name in provider_map:
-                    provider_map[name].calls += calls
+                    for key in provider_map[name].api_keys:
+                        key.calls += calls // max(1, len(provider_map[name].api_keys))
                     provider_map[name].errors += errors
 
         for child, (result, _) in zip(self.children, payloads):
@@ -316,18 +368,23 @@ class AgentNode:
 
     async def _merge(self) -> str:
         child_results = "\n\n".join(
-            f"--- Subtask: {c.task} ---\n{c.result}"
-            for c in self.children
+            f"### {c.task}\n{c.result}" for c in self.children
         )
+
+        ws_context = ""
+        if self.workspace_path:
+            existing = _read_workspace(self.workspace_path)
+            if existing:
+                ws_context = f"\n\nWorkspace:\n{existing[-2000:]}"
+
         system = (
-            "You are an integration agent. Combine results from parallel sub-agents "
-            "into one coherent, well-structured response. Remove redundancy. "
-            "Resolve contradictions. The whole must be better than the sum of parts."
+            "You are HiveMind's integration agent. Synthesise parallel sub-agent outputs "
+            "into one coherent, complete response. Remove redundancy. Resolve contradictions."
         )
-        return await chat(
+        result = await chat(
             [{"role": "user", "content": (
                 f"Original task: {self.task}\n\n"
-                f"Sub-agent outputs:\n{child_results}\n\n"
+                f"Sub-agent outputs:\n{child_results}{ws_context}\n\n"
                 "Produce a unified, complete answer."
             )}],
             system=system,
@@ -335,6 +392,12 @@ class AgentNode:
             temperature=0.3,
             max_tokens=3000,
         )
+
+        # Root node finalises workspace
+        if self.depth == 0 and self.workspace_path:
+            _append_workspace(self.workspace_path, "Final Answer", result)
+
+        return result
 
     def all_nodes(self) -> list["AgentNode"]:
         nodes = [self]
@@ -344,28 +407,15 @@ class AgentNode:
 
 
 def _run_subtask_in_worker(
-    task: str,
-    depth: int,
-    root_task: str,
-    max_depth: int,
-    min_complexity: int,
-    budget: int,
+    task: str, depth: int, root_task: str, max_depth: int,
+    min_complexity: int, budget: int,
 ) -> tuple[str, dict[str, tuple[int, int]]]:
-    """
-    Runs a subtask tree in a Ray worker process.
-    Returns (result, {provider_name: (calls, errors)}) so the parent can
-    patch stats back into its own provider pool — worker pools are isolated.
-    """
     import asyncio as _asyncio
 
     async def _run():
         node = AgentNode(
-            task=task,
-            depth=depth,
-            root_task=root_task,
-            max_depth=max_depth,
-            min_complexity=min_complexity,
-            on_update=None,
+            task=task, depth=depth, root_task=root_task,
+            max_depth=max_depth, min_complexity=min_complexity, on_update=None,
         )
         sem = _asyncio.Semaphore(8)
         await node.run(sem)
