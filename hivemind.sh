@@ -43,17 +43,27 @@ fi
 ok "Python $($PYTHON --version | awk '{print $2}')"
 
 # ── 2. .env check ─────────────────────────────────────────────────────────────
-if [ ! -f ".env" ]; then
+# Prefer ~/.config/hivemind/.env (safe user location) over local .env
+HIVEMIND_CONFIG_DIR="$HOME/.config/hivemind"
+if [ -f "$HIVEMIND_CONFIG_DIR/.env" ]; then
+    ok ".env found ($HIVEMIND_CONFIG_DIR/.env)"
+    # Symlink or copy into repo so python-dotenv's default load_dotenv() finds it
+    # We export the path instead — widget_server.py and main.py both handle CONFIG_PATHS
+    export HIVEMIND_ENV_PATH="$HIVEMIND_CONFIG_DIR/.env"
+
+elif [ -f ".env" ]; then
+    ok ".env found (repo .env)"
+else
     err ".env not found"
     echo ""
     echo -e "  Quick setup:"
-    echo -e "    cp .env.example .env"
-    echo -e "    nano .env           # add at least one provider key"
-    echo -e "    ./hivemind --test   # verify it works"
+    echo -e "    mkdir -p $HIVEMIND_CONFIG_DIR"
+    echo -e "    cp .env.example $HIVEMIND_CONFIG_DIR/.env"
+    echo -e "    nano $HIVEMIND_CONFIG_DIR/.env   # add your API keys"
+    echo -e "    ./hivemind --test"
     echo ""
     exit 1
 fi
-ok ".env found"
 
 # ── 3. Dependency check ───────────────────────────────────────────────────────
 MISSING=()
@@ -81,6 +91,10 @@ echo ""
 if [ "${1:-}" = "--test" ]; then
     shift
     exec "$PYTHON" tests/test_all.py "$@"
+elif [ "${1:-}" = "--server" ]; then
+    shift
+    info "Starting widget server on :7779"
+    exec "$PYTHON" widget_server.py "$@"
 else
     exec "$PYTHON" main.py "$@"
 fi
