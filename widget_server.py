@@ -58,10 +58,11 @@ def _estimate_tokens(text: str) -> int:
 
 class TokenMeter:
     def __init__(self):
-        self._day: str = ""          # "YYYY-MM-DD"
-        self.day_total: int = 0      # accumulated today
-        self.session_total: int = 0  # since server start
-        self._by_provider: dict[str, int] = {}  # per-provider estimates
+        self._day: str = ""
+        self.day_total: int = 0
+        self.session_total: int = 0
+        self._by_provider_tokens: dict[str, int] = {}   # token estimates per provider
+        self._by_provider_calls: dict[str, int] = {}    # API call counts per provider (EOD)
         self._reset_day()
 
     def _today(self) -> str:
@@ -70,18 +71,21 @@ class TokenMeter:
     def _reset_day(self):
         self._day = self._today()
         self.day_total = 0
-        self._by_provider = {}
+        self._by_provider_tokens = {}
+        self._by_provider_calls = {}
 
     def _check_rollover(self):
         if self._today() != self._day:
             self._reset_day()
 
-    def add(self, text: str, provider: str = "unknown") -> int:
+    def add(self, text: str, provider: str = "unknown", calls: int = 0) -> int:
         self._check_rollover()
         n = _estimate_tokens(text)
         self.day_total += n
         self.session_total += n
-        self._by_provider[provider] = self._by_provider.get(provider, 0) + n
+        self._by_provider_tokens[provider] = self._by_provider_tokens.get(provider, 0) + n
+        if calls:
+            self._by_provider_calls[provider] = self._by_provider_calls.get(provider, 0) + calls
         return n
 
     def snapshot(self) -> dict:
@@ -89,7 +93,8 @@ class TokenMeter:
         return {
             "day_total": self.day_total,
             "session_total": self.session_total,
-            "by_provider": dict(self._by_provider),
+            "by_provider": dict(self._by_provider_tokens),
+            "by_provider_calls": dict(self._by_provider_calls),
             "reset_at": "23:59:59",
         }
 
@@ -147,25 +152,49 @@ async def _run_task(task: str) -> AsyncIterator[dict]:
     try:
         run_task.result()
     except Exception as e:
-        yield {"type": "error", "text": str(e)}
+        from core.providers import AllProvidersExhausted
+        if isinstance(e, AllProvidersExhausted):
+            yield {"type": "error", "text": str(e)}
+        else:
+            yield {"type": "error", "text": str(e)}
         return
 
-    # Estimate token usage from result text
     result_text = root.result or ""
     all_nodes = root.all_nodes()
+    agent_count = len(all_nodes)
     full_text = task + " " + " ".join(n.result for n in all_nodes if n.result)
 
-    # Add to meter — attribute to most-used provider
+    # Per-provider call deltas for this request
     stats = pool.stats()
+    per_provider_calls: dict[str, int] = {s["name"]: s["calls"] for s in stats if s["calls"] > 0}
+
     top_provider = max(stats, key=lambda s: s["calls"], default={"name": "unknown"})
-    tokens_used = METER.add(full_text, top_provider["name"])
+    tokens_used = METER.add(full_text, top_provider["name"], calls=top_provider.get("calls", 0))
 
-    usage: dict[str, int] = {s["name"].lower(): s["calls"] for s in stats if s["calls"] > 0}
-    usage["_tokens_this_msg"] = tokens_used
+    # Accumulate all providers' call counts into EOD meter
+    for s in stats:
+        if s["calls"] > 0 and s["name"] != top_provider["name"]:
+            METER._by_provider_calls[s["name"]] = (
+                METER._by_provider_calls.get(s["name"], 0) + s["calls"]
+            )
 
-    yield {"type": "status", "text": f"done — {len(all_nodes)} agent(s)"}
+    yield {"type": "status", "text": f"done — {agent_count} agent(s)"}
     yield {"type": "result", "text": result_text}
-    yield {"type": "usage", **usage, "tokens": METER.snapshot()}
+    # Build per-provider key health summary
+    key_health: dict[str, list[dict]] = {}
+    for s in stats:
+        name = s["name"]
+        if "key_status" in s:
+            key_health[name] = s["key_status"]
+
+    yield {
+        "type": "usage",
+        "agents": agent_count,
+        "per_provider_calls": per_provider_calls,
+        "tokens_this_msg": tokens_used,
+        "tokens": METER.snapshot(),
+        "key_health": key_health,
+    }
 
 # ── POST /chat — HTTP streaming ───────────────────────────────────────────────
 @app.post("/chat")

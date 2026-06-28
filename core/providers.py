@@ -1,16 +1,48 @@
 """
 Provider Pool Manager
 Loads any number of OpenAI-compatible providers from .env and rotates keys.
+Tracks per-key call counts and rate-limit state; selects the least-used
+available key across providers. When all keys are rate-limited it raises
+AllProvidersExhausted so the caller can surface a user-facing message.
 """
 import os
-import asyncio
 import time
+import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
-from itertools import cycle
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+class AllProvidersExhausted(RuntimeError):
+    """Raised when every key across every provider is rate-limited."""
+    pass
+
+
+@dataclass
+class ApiKey:
+    value: str
+    provider_name: str
+    calls: int = 0
+    rate_limited: bool = False
+    rate_limited_at: float = 0.0
+
+    # Auto-clear rate-limit after this many seconds (conservative — most free
+    # tiers reset per-minute or per-day; we use 60s so short limits recover fast
+    # and the day-limit case just accumulates until EOD reset in TokenMeter).
+    COOLDOWN = 60.0
+
+    def is_available(self) -> bool:
+        if not self.rate_limited:
+            return True
+        if time.monotonic() - self.rate_limited_at > self.COOLDOWN:
+            self.rate_limited = False
+        return not self.rate_limited
+
+    def mark_rate_limited(self):
+        self.rate_limited = True
+        self.rate_limited_at = time.monotonic()
 
 
 @dataclass
@@ -18,19 +50,48 @@ class Provider:
     name: str
     base_url: str
     model: str
-    keys: list[str]
+    api_keys: list[ApiKey]
     extra_headers: dict[str, str] = field(default_factory=dict)
-    _key_cycle: object = field(init=False, repr=False)
-    _lock: asyncio.Lock = field(init=False, repr=False)
-    calls: int = 0
     errors: int = 0
 
-    def __post_init__(self):
-        self._key_cycle = cycle(self.keys)
-        self._lock = asyncio.Lock()
+    # Legacy shim — node.py reads p.calls; sum per-key calls on access.
+    @property
+    def calls(self) -> int:
+        return sum(k.calls for k in self.api_keys)
 
-    def next_key(self) -> str:
-        return next(self._key_cycle)
+    @property
+    def keys(self) -> list[str]:
+        return [k.value for k in self.api_keys]
+
+    def best_key(self) -> Optional[ApiKey]:
+        """Return the available key with fewest calls (least-used), or None."""
+        available = [k for k in self.api_keys if k.is_available()]
+        if not available:
+            return None
+        return min(available, key=lambda k: k.calls)
+
+    def all_exhausted(self) -> bool:
+        return all(not k.is_available() for k in self.api_keys)
+
+    def key_status(self) -> list[dict]:
+        return [
+            {
+                "key_suffix": k.value[-6:],
+                "calls": k.calls,
+                "rate_limited": k.rate_limited,
+            }
+            for k in self.api_keys
+        ]
+
+
+def _make_provider(name: str, base_url: str, model: str, raw_keys: str,
+                   extra_headers: dict) -> Provider:
+    keys = [
+        ApiKey(value=v.strip(), provider_name=name)
+        for v in raw_keys.split(",") if v.strip()
+    ]
+    return Provider(name=name, base_url=base_url, model=model,
+                    api_keys=keys, extra_headers=extra_headers)
 
 
 class ProviderPool:
@@ -39,28 +100,20 @@ class ProviderPool:
     def __init__(self):
         self.providers: list[Provider] = []
         self.root_provider: Optional[Provider] = None
-        self._provider_cycle = None
         self._lock = asyncio.Lock()
         self._load_providers()
 
     def _load_providers(self):
-        # Load optional root provider first (excluded from normal pool rotation)
         root_url  = os.environ.get("PROVIDER_ROOT_BASE_URL", "").strip()
-        root_keys = [k.strip() for k in os.environ.get("PROVIDER_ROOT_KEYS", "").split(",") if k.strip()]
+        root_keys = os.environ.get("PROVIDER_ROOT_KEYS", "").strip()
         if root_url and root_keys:
             root_model = os.environ.get("PROVIDER_ROOT_MODEL", "gpt-4o").strip()
-            extra_headers: dict[str, str] = {}
+            extra: dict[str, str] = {}
             if "openrouter.ai" in root_url:
-                extra_headers = {"HTTP-Referer": "https://github.com/hivemind", "X-Title": "HiveMind"}
-            self.root_provider = Provider(
-                name="ROOT",
-                base_url=root_url,
-                model=root_model,
-                keys=root_keys,
-                extra_headers=extra_headers,
-            )
+                extra = {"HTTP-Referer": "https://github.com/hivemind", "X-Title": "HiveMind"}
+            self.root_provider = _make_provider("ROOT", root_url, root_model, root_keys, extra)
 
-        seen = set()
+        seen: set[str] = set()
         for key in os.environ:
             if key.startswith("PROVIDER_") and key.endswith("_BASE_URL"):
                 name = key[len("PROVIDER_"):-len("_BASE_URL")]
@@ -68,28 +121,18 @@ class ProviderPool:
                     continue
                 seen.add(name)
 
-                base_url = os.environ.get(f"PROVIDER_{name}_BASE_URL", "").strip()
-                model = os.environ.get(f"PROVIDER_{name}_MODEL", "gpt-3.5-turbo").strip()
-                raw_keys = os.environ.get(f"PROVIDER_{name}_KEYS", "").strip()
-                keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+                base_url  = os.environ.get(f"PROVIDER_{name}_BASE_URL", "").strip()
+                model     = os.environ.get(f"PROVIDER_{name}_MODEL", "gpt-3.5-turbo").strip()
+                raw_keys  = os.environ.get(f"PROVIDER_{name}_KEYS", "").strip()
 
-                if not base_url or not keys:
+                if not base_url or not raw_keys:
                     continue
 
-                extra_headers: dict[str, str] = {}
+                extra: dict[str, str] = {}
                 if "openrouter.ai" in base_url:
-                    extra_headers = {
-                        "HTTP-Referer": "https://github.com/hivemind",
-                        "X-Title": "HiveMind",
-                    }
+                    extra = {"HTTP-Referer": "https://github.com/hivemind", "X-Title": "HiveMind"}
 
-                self.providers.append(Provider(
-                    name=name,
-                    base_url=base_url,
-                    model=model,
-                    keys=keys,
-                    extra_headers=extra_headers,
-                ))
+                self.providers.append(_make_provider(name, base_url, model, raw_keys, extra))
 
         if not self.providers:
             raise RuntimeError(
@@ -97,23 +140,33 @@ class ProviderPool:
                 "Copy .env.example to .env and fill in at least one provider."
             )
 
-        self._provider_cycle = cycle(self.providers)
-
     def next_provider(self) -> Provider:
-        """Round-robin across providers"""
-        return next(self._provider_cycle)
+        """Return the provider whose best available key has the fewest calls."""
+        candidates = [p for p in self.providers if not p.all_exhausted()]
+        if not candidates:
+            raise AllProvidersExhausted(
+                "All API keys are rate-limited. Please wait a moment or add more keys."
+            )
+        return min(candidates, key=lambda p: p.best_key().calls)  # type: ignore[union-attr]
+
+    def any_available(self) -> bool:
+        return any(not p.all_exhausted() for p in self.providers)
 
     def stats(self) -> list[dict]:
         rows = []
         if self.root_provider:
             p = self.root_provider
-            rows.append({"name": p.name, "model": p.model, "keys": len(p.keys),
-                         "calls": p.calls, "errors": p.errors})
-        rows += [
-            {"name": p.name, "model": p.model, "keys": len(p.keys),
-             "calls": p.calls, "errors": p.errors}
-            for p in self.providers
-        ]
+            rows.append({
+                "name": p.name, "model": p.model,
+                "calls": p.calls, "errors": p.errors,
+                "keys": len(p.api_keys), "key_status": p.key_status(),
+            })
+        for p in self.providers:
+            rows.append({
+                "name": p.name, "model": p.model,
+                "calls": p.calls, "errors": p.errors,
+                "keys": len(p.api_keys), "key_status": p.key_status(),
+            })
         return rows
 
 

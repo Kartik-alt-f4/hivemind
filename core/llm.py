@@ -5,11 +5,11 @@ with automatic key rotation and retry on rate-limit errors.
 import asyncio
 import json
 import httpx
-from core.providers import get_pool, Provider
+from core.providers import get_pool, Provider, AllProvidersExhausted
 
 
-MAX_RETRIES = 4
-RETRY_DELAY = 2.0  # seconds, doubles on each retry
+MAX_RETRIES = 6
+RETRY_DELAY = 1.0  # seconds, doubles on each retry
 
 
 async def chat(
@@ -22,32 +22,38 @@ async def chat(
 ) -> str:
     """
     Send a chat completion request. Returns the assistant's reply as a string.
-    Rotates providers/keys automatically on 429 or connection errors.
-    When depth==0 and a root provider is configured, tries it first before falling back.
+    Picks the least-used available key across providers on each attempt.
+    When depth==0 and a root provider is configured, tries it first.
+    Raises AllProvidersExhausted when every key is rate-limited.
     """
+    import sys
     pool = get_pool()
     delay = RETRY_DELAY
     last_error = "unknown"
 
-    # depth=0 gets the root provider as first candidate (if configured)
     use_root = depth == 0 and pool.root_provider is not None
     root_tried = False
 
-    # Filter out providers with too many errors (likely misconfigured)
-    ERROR_BLACKLIST_THRESHOLD = 5
-
     for attempt in range(MAX_RETRIES):
-        # Pick provider: root first on depth=0, then normal pool rotation
+        # Pick provider + key
         if use_root and not root_tried:
             p = pool.root_provider
             root_tried = True
+            api_key = p.best_key() or p.api_keys[0]
         elif provider is not None:
             p = provider
+            api_key = p.best_key() or p.api_keys[0]
         else:
-            healthy = [p for p in pool.providers if p.errors < ERROR_BLACKLIST_THRESHOLD]
-            candidate_pool = healthy if healthy else pool.providers
-            p = next(iter(candidate_pool)) if len(candidate_pool) == 1 else pool.next_provider()
-        key = p.next_key()
+            if not pool.any_available():
+                raise AllProvidersExhausted(
+                    "All API keys are currently rate-limited. "
+                    "Please wait a moment or add more keys to your .env."
+                )
+            p = pool.next_provider()
+            api_key = p.best_key()
+            if api_key is None:
+                # Shouldn't happen given any_available() check, but be safe
+                continue
 
         payload = {
             "model": p.model,
@@ -64,7 +70,7 @@ async def chat(
                 resp = await client.post(
                     f"{p.base_url}/chat/completions",
                     headers={
-                        "Authorization": f"Bearer {key}",
+                        "Authorization": f"Bearer {api_key.value}",
                         "Content-Type": "application/json",
                         **p.extra_headers,
                     },
@@ -72,17 +78,26 @@ async def chat(
                 )
 
             if resp.status_code == 429:
+                api_key.mark_rate_limited()
                 p.errors += 1
+                print(
+                    f"\033[2m[llm] 429 on {p.name} key …{api_key.value[-6:]} "
+                    f"({sum(1 for k in p.api_keys if k.is_available())} keys left in provider)\033[0m",
+                    file=sys.stderr,
+                )
                 if p is pool.root_provider:
-                    import sys; print(f"\033[2m[llm] root provider 429 — falling back to pool\033[0m", file=sys.stderr)
+                    print(f"\033[2m[llm] root provider 429 — falling back to pool\033[0m", file=sys.stderr)
+                if not pool.any_available():
+                    raise AllProvidersExhausted(
+                        "All API keys are currently rate-limited. "
+                        "Please wait a moment or add more keys to your .env."
+                    )
                 await asyncio.sleep(delay)
                 delay *= 2
-                provider = None  # try a different provider next round
+                provider = None
                 continue
 
             if resp.status_code == 400:
-                # Bad request from this provider (wrong model, unsupported param, etc.)
-                # Log and failover to next provider rather than crashing
                 p.errors += 1
                 try:
                     detail = resp.json()
@@ -90,20 +105,23 @@ async def chat(
                     detail = resp.text[:200]
                 last_error = f"400 from {p.name}: {detail}"
                 if p is pool.root_provider:
-                    import sys; print(f"\033[2m[llm] root provider 400 — falling back to pool\033[0m", file=sys.stderr)
-                provider = None  # force switch
+                    print(f"\033[2m[llm] root provider 400 — falling back to pool\033[0m", file=sys.stderr)
+                provider = None
                 continue
 
             resp.raise_for_status()
             data = resp.json()
-            p.calls += 1
+            api_key.calls += 1
             return data["choices"][0]["message"]["content"]
+
+        except AllProvidersExhausted:
+            raise
 
         except (httpx.ConnectError, httpx.TimeoutException, KeyError) as e:
             p.errors += 1
             last_error = str(e)
             if p is pool.root_provider:
-                import sys; print(f"\033[2m[llm] root provider error ({e.__class__.__name__}) — falling back to pool\033[0m", file=sys.stderr)
+                print(f"\033[2m[llm] root provider error ({e.__class__.__name__}) — falling back\033[0m", file=sys.stderr)
             if attempt == MAX_RETRIES - 1:
                 raise RuntimeError(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
             await asyncio.sleep(delay)
