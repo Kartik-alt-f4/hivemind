@@ -19,6 +19,7 @@ class Provider:
     base_url: str
     model: str
     keys: list[str]
+    extra_headers: dict[str, str] = field(default_factory=dict)
     _key_cycle: object = field(init=False, repr=False)
     _lock: asyncio.Lock = field(init=False, repr=False)
     calls: int = 0
@@ -58,11 +59,19 @@ class ProviderPool:
                 if not base_url or not keys:
                     continue
 
+                extra_headers: dict[str, str] = {}
+                if "openrouter.ai" in base_url:
+                    extra_headers = {
+                        "HTTP-Referer": "https://github.com/hivemind",
+                        "X-Title": "HiveMind",
+                    }
+
                 self.providers.append(Provider(
                     name=name,
                     base_url=base_url,
                     model=model,
                     keys=keys,
+                    extra_headers=extra_headers,
                 ))
 
         if not self.providers:

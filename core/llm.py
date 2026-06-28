@@ -54,6 +54,7 @@ async def chat(
                     headers={
                         "Authorization": f"Bearer {key}",
                         "Content-Type": "application/json",
+                        **p.extra_headers,
                     },
                     json=payload,
                 )
