@@ -142,6 +142,7 @@ class AgentNode:
         return await chat(
             [{"role": "user", "content": f"Task: {self.task}\n\nSolve this completely."}],
             system=system, temperature=0.5, max_tokens=2048,
+            depth=self.depth,
         )
 
     async def _plan(self) -> str:
@@ -199,6 +200,7 @@ class AgentNode:
             system=system,
             temperature=0.3,
             max_tokens=800,
+            depth=self.depth,
         )
 
         _debug_log(f"[{self.agent_id}] depth={self.depth} budget={budget} | {response[:120].strip()}")
@@ -329,6 +331,7 @@ class AgentNode:
                 "Produce a unified, complete answer."
             )}],
             system=system,
+            depth=self.depth,
             temperature=0.3,
             max_tokens=3000,
         )

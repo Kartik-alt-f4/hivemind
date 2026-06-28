@@ -38,16 +38,33 @@ class ProviderPool:
 
     def __init__(self):
         self.providers: list[Provider] = []
+        self.root_provider: Optional[Provider] = None
         self._provider_cycle = None
         self._lock = asyncio.Lock()
         self._load_providers()
 
     def _load_providers(self):
+        # Load optional root provider first (excluded from normal pool rotation)
+        root_url  = os.environ.get("PROVIDER_ROOT_BASE_URL", "").strip()
+        root_keys = [k.strip() for k in os.environ.get("PROVIDER_ROOT_KEYS", "").split(",") if k.strip()]
+        if root_url and root_keys:
+            root_model = os.environ.get("PROVIDER_ROOT_MODEL", "gpt-4o").strip()
+            extra_headers: dict[str, str] = {}
+            if "openrouter.ai" in root_url:
+                extra_headers = {"HTTP-Referer": "https://github.com/hivemind", "X-Title": "HiveMind"}
+            self.root_provider = Provider(
+                name="ROOT",
+                base_url=root_url,
+                model=root_model,
+                keys=root_keys,
+                extra_headers=extra_headers,
+            )
+
         seen = set()
         for key in os.environ:
             if key.startswith("PROVIDER_") and key.endswith("_BASE_URL"):
                 name = key[len("PROVIDER_"):-len("_BASE_URL")]
-                if name in seen:
+                if name in seen or name == "ROOT":
                     continue
                 seen.add(name)
 
@@ -87,11 +104,17 @@ class ProviderPool:
         return next(self._provider_cycle)
 
     def stats(self) -> list[dict]:
-        return [
+        rows = []
+        if self.root_provider:
+            p = self.root_provider
+            rows.append({"name": p.name, "model": p.model, "keys": len(p.keys),
+                         "calls": p.calls, "errors": p.errors})
+        rows += [
             {"name": p.name, "model": p.model, "keys": len(p.keys),
              "calls": p.calls, "errors": p.errors}
             for p in self.providers
         ]
+        return rows
 
 
 # Singleton
