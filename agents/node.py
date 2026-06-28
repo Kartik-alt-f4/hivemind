@@ -2,6 +2,7 @@
 Agent Node - the recursive unit of the HiveMind tree.
 Marker-based planning: ##SPLIT##, ##SOLVE##, ##CLARIFY##
 Budget enforced BEFORE child instantiation to prevent explosions.
+Ray integration: parallel subtasks run in separate processes when Ray is available.
 """
 import asyncio
 import re
@@ -13,6 +14,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Callable
 from core.llm import chat
+
+try:
+    import ray
+    _RAY_AVAILABLE = True
+except ImportError:
+    _RAY_AVAILABLE = False
+
+# Minimum fan-out to justify Ray process startup overhead (~10-15s per worker).
+# Below this threshold, asyncio.gather is faster.
+RAY_THRESHOLD = 4
 
 
 def _debug_log(msg: str):
@@ -42,6 +53,7 @@ class AgentNode:
     depth: int = 0
     parent_id: Optional[str] = None
     agent_id: str = field(default_factory=lambda: uuid.uuid4().hex[:6])
+    root_task: str = ""  # original root objective, propagated to all descendants
 
     status: AgentStatus = AgentStatus.PENDING
     children: list["AgentNode"] = field(default_factory=list)
@@ -56,6 +68,8 @@ class AgentNode:
 
     def __post_init__(self):
         _agent_registry[self.agent_id] = self
+        if not self.root_task:
+            self.root_task = self.task  # root node seeds its own task
 
     def _emit(self):
         if self.on_update:
@@ -145,24 +159,35 @@ class AgentNode:
             if self.depth == 0 else ""
         )
 
+        root_context = (
+            ""
+            if self.depth == 0 or self.root_task == self.task
+            else f"\nROOT OBJECTIVE (keep this in mind): {self.root_task}\n"
+        )
+
         system = (
-            f"You are agent node depth={self.depth}/{self.max_depth} in a recursive multi-agent cluster.\n\n"
+            f"You are agent node depth={self.depth}/{self.max_depth} in a recursive multi-agent cluster.\n"
+            + root_context
+            + "\n"
             + (
                 "You are the ROOT NODE. Your job is to ORCHESTRATE, not to answer.\n"
                 "Split this task into independent workstreams for sub-agents UNLESS it is\n"
                 "genuinely a single atomic question (one fact, one calculation).\n"
                 "When in doubt at depth=0: SPLIT.\n\n"
                 if self.depth == 0 else
+                "ATOMICITY CHECK: Before splitting, ask — is this task a single domain with a single deliverable?\n"
+                "If yes → ##SOLVE## immediately, do not split.\n"
                 "RULE: Split into 2-3 parts only if they are TRULY independent workstreams.\n"
                 "RULE: depth >= 3 → always ##SOLVE## (you're deep enough).\n"
                 "RULE: narrow/specific tasks → always ##SOLVE##.\n"
+                "DEPENDENCY RULE: If any subtask needs another subtask's output, do NOT split — ##SOLVE## instead.\n"
             )
             + f"{budget_note}\n\n"
             "OUTPUT — pick exactly one:\n\n"
             "##SPLIT##\n"
             "- [self-contained subtask 1 with full context]\n"
             "- [self-contained subtask 2 with full context]\n"
-            "- [subtask 3 only if truly needed]\n\n"
+            "- [subtask 3 only if truly needed and fully independent]\n\n"
             "##SOLVE##\n"
             "[your complete answer here]\n"
             + clarify_option +
@@ -192,6 +217,17 @@ class AgentNode:
                     subtasks.append(t)
         return subtasks if len(subtasks) >= 2 else []
 
+    def _subtasks_have_dependencies(self, subtasks: list[str]) -> bool:
+        """Detect if any subtask references output/result of another subtask by keyword overlap."""
+        dep_phrases = re.compile(
+            r"\b(result of|output of|based on|using the|after|once|from step|from part)\b",
+            re.IGNORECASE,
+        )
+        for task in subtasks:
+            if dep_phrases.search(task):
+                return True
+        return False
+
     async def _split_and_merge(self, subtasks: list[str], semaphore: asyncio.Semaphore):
         self.status = AgentStatus.RUNNING
         self._emit()
@@ -215,6 +251,7 @@ class AgentNode:
                 task=st,
                 depth=self.depth + 1,
                 parent_id=self.agent_id,
+                root_task=self.root_task,
                 max_depth=self.max_depth,
                 min_complexity=self.min_complexity,
                 on_update=self.on_update,
@@ -224,13 +261,56 @@ class AgentNode:
         _debug_log(f"[{self.agent_id}] SPLIT into {len(self.children)} | registry={len(_agent_registry)}/{MAX_TOTAL_AGENTS}")
         self._emit()
 
-        await asyncio.gather(*[child.run(semaphore) for child in self.children])
+        sequential = self._subtasks_have_dependencies(subtasks)
+        if sequential:
+            _debug_log(f"[{self.agent_id}] SEQUENTIAL mode — subtask dependencies detected")
+            for child in self.children:
+                await child.run(semaphore)
+        elif _RAY_AVAILABLE and len(subtasks) >= RAY_THRESHOLD:
+            ray.init(ignore_reinit_error=True, log_to_driver=False)
+            await self._run_children_ray(semaphore)
+        else:
+            await asyncio.gather(*[child.run(semaphore) for child in self.children])
 
         self.status = AgentStatus.MERGING
         self._emit()
         self.result = await self._merge()
         self.status = AgentStatus.DONE
         self._emit()
+
+    async def _run_children_ray(self, semaphore: asyncio.Semaphore):
+        """Dispatch all children as Ray remote tasks (true multi-process parallelism)."""
+        budget_per_child = max(1, self._budget() // len(self.children))
+        refs = [
+            _ray_run_subtask.remote(
+                child.task,
+                child.depth,
+                child.root_task,
+                child.max_depth,
+                child.min_complexity,
+                budget_per_child,
+            )
+            for child in self.children
+        ]
+        _debug_log(f"[{self.agent_id}] RAY dispatched {len(refs)} remote tasks")
+
+        loop = asyncio.get_event_loop()
+        payloads = await loop.run_in_executor(None, ray.get, refs)
+
+        # Patch worker provider stats back into this process's pool
+        from core.providers import get_pool
+        pool = get_pool()
+        provider_map = {p.name: p for p in pool.providers}
+        for result, worker_stats in payloads:
+            for name, (calls, errors) in worker_stats.items():
+                if name in provider_map:
+                    provider_map[name].calls += calls
+                    provider_map[name].errors += errors
+
+        for child, (result, _) in zip(self.children, payloads):
+            child.result = result or ""
+            child.status = AgentStatus.DONE
+            child._emit()
 
     async def _merge(self) -> str:
         child_results = "\n\n".join(
@@ -258,3 +338,41 @@ class AgentNode:
         for child in self.children:
             nodes.extend(child.all_nodes())
         return nodes
+
+
+def _run_subtask_in_worker(
+    task: str,
+    depth: int,
+    root_task: str,
+    max_depth: int,
+    min_complexity: int,
+    budget: int,
+) -> tuple[str, dict[str, tuple[int, int]]]:
+    """
+    Runs a subtask tree in a Ray worker process.
+    Returns (result, {provider_name: (calls, errors)}) so the parent can
+    patch stats back into its own provider pool — worker pools are isolated.
+    """
+    import asyncio as _asyncio
+
+    async def _run():
+        node = AgentNode(
+            task=task,
+            depth=depth,
+            root_task=root_task,
+            max_depth=max_depth,
+            min_complexity=min_complexity,
+            on_update=None,
+        )
+        sem = _asyncio.Semaphore(8)
+        await node.run(sem)
+
+        from core.providers import get_pool
+        stats = {p.name: (p.calls, p.errors) for p in get_pool().providers}
+        return node.result, stats
+
+    return _asyncio.run(_run())
+
+
+if _RAY_AVAILABLE:
+    _ray_run_subtask = ray.remote(_run_subtask_in_worker)
