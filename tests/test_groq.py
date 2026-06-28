@@ -205,4 +205,5 @@ async def main():
         info("The cluster will fall back to Gemini in the meantime")
     print()
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

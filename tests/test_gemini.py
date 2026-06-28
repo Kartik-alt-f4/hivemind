@@ -124,7 +124,8 @@ async def test_model_list(key: str):
             info(f"Models endpoint returned {r.status_code} — skipping")
             return
         data = r.json()
-        models = sorted([m["id"] for m in data.get("data", [])])
+        # Gemini returns IDs like "models/gemini-2.0-flash-lite" — strip the prefix for comparison
+        models = sorted([m["id"].removeprefix("models/") for m in data.get("data", [])])
         ok(f"{len(models)} models available:")
         for m in models:
             marker = " ◄ CURRENT" if m == MODEL else ""
