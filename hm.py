@@ -254,76 +254,99 @@ def run_task(task: str, history: list[dict]) -> str | None:
 
     tree = AgentTree() if _RICH else None
 
-    def _stream_loop(live: "Live | None"):
-        nonlocal result_text, error_text
-        with httpx.Client(timeout=None) as client:
-            with client.stream("POST", f"{SERVER_URL}/chat", json=payload) as resp:
-                resp.raise_for_status()
-                for raw_line in resp.iter_lines():
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+    # stream_done signals the render loop to stop; stream_exc carries any error
+    stream_done  = threading.Event()
+    stream_exc:  list[Exception] = []
+    sudo_pending: list[dict]     = []   # sudo events that need interactive handling
 
-                    mtype = msg.get("type")
-                    if mtype == "node_update":
-                        if tree:
-                            tree.update(msg)
-                            if live:
-                                live.update(tree.panel())
-                    elif mtype == "status":
-                        if live:
-                            live.update(tree.panel())
-                    elif mtype == "result":
-                        result_text.append(msg.get("text", ""))
-                    elif mtype == "error":
-                        error_text.append(msg.get("text", ""))
-                    elif mtype == "usage":
-                        stats_data.append(msg)
-                    elif mtype == "files":
-                        files_written.extend(msg.get("paths", []))
-                    elif mtype == "shell_run":
-                        deferred_shell.append({"kind": "shell", **msg})
-                    elif mtype == "sudo_prompt":
-                        # Must handle sudo interactively — pause live and prompt
-                        if live:
-                            live.stop()
+    def _stream_thread():
+        """Runs in background thread — reads SSE stream, updates tree state."""
+        try:
+            with httpx.Client(timeout=None) as client:
+                with client.stream("POST", f"{SERVER_URL}/chat", json=payload) as resp:
+                    resp.raise_for_status()
+                    for raw_line in resp.iter_lines():
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        mtype = msg.get("type")
+                        if mtype == "node_update":
+                            if tree:
+                                tree.update(msg)
+                        elif mtype == "result":
+                            result_text.append(msg.get("text", ""))
+                        elif mtype == "error":
+                            error_text.append(msg.get("text", ""))
+                        elif mtype == "usage":
+                            stats_data.append(msg)
+                        elif mtype == "files":
+                            files_written.extend(msg.get("paths", []))
+                        elif mtype == "shell_run":
+                            deferred_shell.append(msg)
+                        elif mtype == "sudo_prompt":
+                            sudo_pending.append(msg)
+        except Exception as e:
+            stream_exc.append(e)
+        finally:
+            stream_done.set()
+
+    t = threading.Thread(target=_stream_thread, daemon=True)
+    t.start()
+
+    try:
+        if _RICH:
+            with Live(tree.panel(), console=console, refresh_per_second=10,
+                      vertical_overflow="visible", transient=True) as live:
+                while not stream_done.is_set():
+                    if sudo_pending:
+                        msg = sudo_pending.pop(0)
+                        live.stop()
                         cmd_str = msg.get("cmd", "")
                         sudo_req_id = msg.get("request_id", req_id)
-                        console.print(f"\n[yellow]⚠ sudo required for:[/yellow] [dim]{escape(cmd_str)}[/dim]")
+                        console.print(f"\n[yellow]⚠ sudo:[/yellow] [dim]{escape(cmd_str)}[/dim]")
                         try:
                             pw = getpass.getpass("  Password: ")
                         except (KeyboardInterrupt, EOFError):
                             pw = ""
                         try:
-                            httpx.post(
-                                f"{SERVER_URL}/sudo-input",
-                                json={"request_id": sudo_req_id, "password": pw},
-                                timeout=5,
-                            )
+                            httpx.post(f"{SERVER_URL}/sudo-input",
+                                       json={"request_id": sudo_req_id, "password": pw},
+                                       timeout=5)
                         except Exception:
                             pass
-                        if live:
-                            live.start()
-
-    try:
-        if _RICH and sys.stderr.isatty():
-            with Live(tree.panel(), console=console, refresh_per_second=8,
-                      vertical_overflow="visible") as live:
-                _stream_loop(live)
+                        live.start()
+                    live.update(tree.panel())
+                    time.sleep(0.10)
+                # Hold final state for 0.5s so user can see the completed tree
+                live.update(tree.panel())
+                time.sleep(0.5)
         else:
-            _stream_loop(None)
+            stream_done.wait()
     except KeyboardInterrupt:
+        stream_done.set()
         print()
         return None
     except Exception as e:
+        stream_done.set()
         _print_error(str(e))
         return None
 
-    # Print deferred shell output after the live panel closes
+    t.join(timeout=5)
+
+    if stream_exc:
+        _print_error(str(stream_exc[0]))
+        return None
+
+    # Always print the final tree state after run completes
+    if _RICH and tree and tree._nodes:
+        console.print(tree.panel())
+
+    # Print shell output after the live panel has closed
     if deferred_shell and _RICH:
         for ev in deferred_shell:
             console.print(f"\n[dim]$ {escape(ev.get('cmd', ''))}[/dim]")

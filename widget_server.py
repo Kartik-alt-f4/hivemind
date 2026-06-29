@@ -208,16 +208,20 @@ async def _run_task(task: str, cwd: str | None = None, request_id: str | None = 
     )
     semaphore = asyncio.Semaphore(8)
 
-    # Run the agent tree; drain event_q and send keep-alive pings every 0.5s
+    # Run the agent tree; drain event_q frequently for near-real-time updates
     run_task = asyncio.create_task(root.run(semaphore))
+    heartbeat_counter = 0
     try:
         while not run_task.done():
-            done, _ = await asyncio.wait({run_task}, timeout=0.5)
-            # Flush any shell/sudo events that arrived
+            done, _ = await asyncio.wait({run_task}, timeout=0.05)
+            # Flush all queued events immediately (node_update, shell_run, sudo)
             while not event_q.empty():
                 yield event_q.get_nowait()
-            if not done:
+            # Send a heartbeat every ~1s so client knows we're alive
+            heartbeat_counter += 1
+            if heartbeat_counter >= 20 and not done:
                 yield {"type": "status", "text": "working…"}
+                heartbeat_counter = 0
         # Final flush
         while not event_q.empty():
             yield event_q.get_nowait()
