@@ -372,6 +372,8 @@ class AgentNode:
             temperature=0.3,
             max_tokens=1024,
             depth=self.depth,
+            max_depth=self.max_depth,
+            prefer_root=True,  # shell follow-up is a leaf-level solve, use tier 0
         )
         return f"{clean}\n\n{followup}".strip()
 
@@ -404,7 +406,8 @@ class AgentNode:
             temperature=0.2,
             max_tokens=1500,
             depth=0,
-            prefer_merge=True,  # architecture pass uses the heaviest model
+            max_depth=self.max_depth,
+            prefer_root=True,  # ARCHITECT is always tier 0
         )
 
         # Parse file count from design doc
@@ -427,8 +430,9 @@ class AgentNode:
         return await chat(
             [{"role": "user", "content": f"Task: {self.task}\n\nSolve this completely.{ws_context}"}],
             system="You are a HiveMind agent. Answer the task directly and completely.",
-            temperature=0.5, max_tokens=2048, depth=self.depth,
-            prefer_root=self.is_project,
+            temperature=0.5, max_tokens=2048,
+            depth=self.depth, max_depth=self.max_depth,
+            prefer_root=True,  # force solve = leaf node = tier 0 (bottom of V)
         )
 
     async def _plan(self) -> str:
@@ -529,14 +533,16 @@ class AgentNode:
         # Coding tasks need more tokens and the strongest model available
         plan_tokens = 2000 if self.is_project else 600
 
-        # Root orchestration uses root model; leaf solves use pool (light models going down)
+        # V-shape: depth 0 and leaf nodes → tier 0; middle depths → lighter tiers
+        is_leaf_solve = "##SOLVE##" in system or self.depth >= self.max_depth - 1
         response = await chat(
             [{"role": "user", "content": user_msg}],
             system=system,
             temperature=0.3,
             max_tokens=plan_tokens,
             depth=self.depth,
-            prefer_root=(self.depth == 0),  # only root orchestrator gets the heavy model going down
+            max_depth=self.max_depth,
+            prefer_root=(self.depth == 0 or is_leaf_solve),
         )
 
         _debug_log(f"[{self.task_id}] depth={self.depth} budget={budget} | {response[:120].strip()}")
@@ -671,6 +677,7 @@ class AgentNode:
             "6. End with a concise '## How to run' section.\n"
             "Do not summarise or truncate — output the full content of every file."
         )
+        # V-shape going back up: depth 0 merge → tier 0, deeper merges → lighter
         result = await chat(
             [{"role": "user", "content": (
                 f"Original task: {self.task}\n\n"
@@ -679,9 +686,10 @@ class AgentNode:
             )}],
             system=system,
             depth=self.depth,
+            max_depth=self.max_depth,
             temperature=0.3,
             max_tokens=4000,
-            prefer_merge=True,  # merge/synthesis passes always get the heaviest model
+            prefer_merge=True,
         )
 
         # Root node finalises workspace with tree summary

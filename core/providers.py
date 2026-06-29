@@ -1,9 +1,21 @@
 """
 Provider Pool Manager
-Loads any number of OpenAI-compatible providers from .env and rotates keys.
-Tracks per-key call counts and rate-limit state; selects the least-used
-available key across providers. When all keys are rate-limited it raises
-AllProvidersExhausted so the caller can surface a user-facing message.
+Loads providers from .env and organises them into quality tiers.
+
+Tier ordering (0 = strongest, N = lightest):
+  PROVIDER_ROOT_*   → tier 0  (root plan + leaf solves + final merge)
+  PROVIDER_TIER1_*  → tier 1  (one level in from root/leaf)
+  PROVIDER_TIER2_*  → tier 2  (two levels in)
+  ...
+  PROVIDER_*        → lowest tier (any remaining named providers)
+
+The V-shape routing in llm.py maps depth → tier going down, and
+(max_depth - depth) → tier coming back up on merges. Leaf nodes and
+root node both resolve to tier 0 (same model quality, different token
+budgets). Middle of the tree uses lighter models.
+
+If a tier has no provider configured it falls back to the next available
+tier (graceful degradation).
 """
 import os
 import time
@@ -28,9 +40,6 @@ class ApiKey:
     rate_limited: bool = False
     rate_limited_at: float = 0.0
 
-    # Auto-clear rate-limit after this many seconds (conservative — most free
-    # tiers reset per-minute or per-day; we use 60s so short limits recover fast
-    # and the day-limit case just accumulates until EOD reset in TokenMeter).
     COOLDOWN = 60.0
 
     def is_available(self) -> bool:
@@ -54,7 +63,6 @@ class Provider:
     extra_headers: dict[str, str] = field(default_factory=dict)
     errors: int = 0
 
-    # Legacy shim — node.py reads p.calls; sum per-key calls on access.
     @property
     def calls(self) -> int:
         return sum(k.calls for k in self.api_keys)
@@ -64,7 +72,6 @@ class Provider:
         return [k.value for k in self.api_keys]
 
     def best_key(self) -> Optional[ApiKey]:
-        """Return the available key with fewest calls (least-used), or None."""
         available = [k for k in self.api_keys if k.is_available()]
         if not available:
             return None
@@ -95,94 +102,123 @@ def _make_provider(name: str, base_url: str, model: str, raw_keys: str,
                     api_keys=keys, extra_headers=extra_headers)
 
 
+def _extra_headers(base_url: str) -> dict[str, str]:
+    if "openrouter.ai" in base_url:
+        return {"HTTP-Referer": "https://github.com/hivemind", "X-Title": "HiveMind"}
+    return {}
+
+
 class ProviderPool:
-    """Discovers and manages all PROVIDER_* entries in .env"""
+    """
+    Manages providers organised into quality tiers (0 = strongest).
+
+    tiers: list[Provider]  — index 0 is strongest (ROOT), ascending = lighter
+    providers: list[Provider]  — alias for the lowest tier, used for pool rotation
+    root_provider: Provider  — tier 0 (backwards compat)
+    merge_provider: Provider  — tier 0 (final merge; same model, heavier budget in llm.py)
+    """
 
     def __init__(self):
-        self.providers: list[Provider] = []
-        self.root_provider: Optional[Provider] = None
-        self.merge_provider: Optional[Provider] = None  # heavy model for merge/integration
+        self.tiers: list[Provider] = []   # ordered strongest → lightest
         self._lock = asyncio.Lock()
         self._load_providers()
 
     def _load_providers(self):
+        reserved = {"ROOT", "MERGE"}
+
+        # ── Tier 0: ROOT ──────────────────────────────────────────────────────
         root_url  = os.environ.get("PROVIDER_ROOT_BASE_URL", "").strip()
         root_keys = os.environ.get("PROVIDER_ROOT_KEYS", "").strip()
         if root_url and root_keys:
             root_model = os.environ.get("PROVIDER_ROOT_MODEL", "gpt-4o").strip()
-            extra: dict[str, str] = {}
-            if "openrouter.ai" in root_url:
-                extra = {"HTTP-Referer": "https://github.com/hivemind", "X-Title": "HiveMind"}
-            self.root_provider = _make_provider("ROOT", root_url, root_model, root_keys, extra)
+            self.tiers.append(_make_provider("ROOT", root_url, root_model,
+                                             root_keys, _extra_headers(root_url)))
 
-        # Optional dedicated merge provider (heavy model for synthesis passes)
-        merge_url  = os.environ.get("PROVIDER_MERGE_BASE_URL", "").strip()
-        merge_keys = os.environ.get("PROVIDER_MERGE_KEYS", "").strip()
-        if merge_url and merge_keys:
-            merge_model = os.environ.get("PROVIDER_MERGE_MODEL", "gpt-4o").strip()
-            extra_m: dict[str, str] = {}
-            if "openrouter.ai" in merge_url:
-                extra_m = {"HTTP-Referer": "https://github.com/hivemind", "X-Title": "HiveMind"}
-            self.merge_provider = _make_provider("MERGE", merge_url, merge_model, merge_keys, extra_m)
-        else:
-            # Fall back to root provider for merge passes
-            self.merge_provider = self.root_provider
+        # ── Named tiers: TIER1, TIER2, … ─────────────────────────────────────
+        tier_idx = 1
+        while True:
+            name = f"TIER{tier_idx}"
+            url  = os.environ.get(f"PROVIDER_{name}_BASE_URL", "").strip()
+            keys = os.environ.get(f"PROVIDER_{name}_KEYS", "").strip()
+            if not url or not keys:
+                break
+            model = os.environ.get(f"PROVIDER_{name}_MODEL", "gpt-3.5-turbo").strip()
+            self.tiers.append(_make_provider(name, url, model, keys, _extra_headers(url)))
+            reserved.add(name)
+            tier_idx += 1
 
+        # ── Remaining named providers → lowest tier ───────────────────────────
         seen: set[str] = set()
         for key in os.environ:
             if key.startswith("PROVIDER_") and key.endswith("_BASE_URL"):
                 name = key[len("PROVIDER_"):-len("_BASE_URL")]
-                if name in seen or name in ("ROOT", "MERGE"):
+                if name in reserved or name in seen:
                     continue
                 seen.add(name)
+                url   = os.environ.get(f"PROVIDER_{name}_BASE_URL", "").strip()
+                model = os.environ.get(f"PROVIDER_{name}_MODEL", "gpt-3.5-turbo").strip()
+                raw   = os.environ.get(f"PROVIDER_{name}_KEYS", "").strip()
+                if url and raw:
+                    self.tiers.append(_make_provider(name, url, model, raw,
+                                                     _extra_headers(url)))
 
-                base_url  = os.environ.get(f"PROVIDER_{name}_BASE_URL", "").strip()
-                model     = os.environ.get(f"PROVIDER_{name}_MODEL", "gpt-3.5-turbo").strip()
-                raw_keys  = os.environ.get(f"PROVIDER_{name}_KEYS", "").strip()
-
-                if not base_url or not raw_keys:
-                    continue
-
-                extra: dict[str, str] = {}
-                if "openrouter.ai" in base_url:
-                    extra = {"HTTP-Referer": "https://github.com/hivemind", "X-Title": "HiveMind"}
-
-                self.providers.append(_make_provider(name, base_url, model, raw_keys, extra))
-
-        if not self.providers:
+        if not self.tiers:
             raise RuntimeError(
                 "No providers found in .env!\n"
                 "Copy .env.example to .env and fill in at least one provider."
             )
 
+    # ── Backwards-compat properties ───────────────────────────────────────────
+
+    @property
+    def root_provider(self) -> Optional[Provider]:
+        return self.tiers[0] if self.tiers else None
+
+    @property
+    def merge_provider(self) -> Optional[Provider]:
+        return self.tiers[0] if self.tiers else None
+
+    @property
+    def providers(self) -> list[Provider]:
+        """Lowest tier providers — used for pool rotation fallback."""
+        return self.tiers[-1:] if self.tiers else []
+
+    # ── Tier resolution ───────────────────────────────────────────────────────
+
+    def provider_for_tier(self, tier_idx: int) -> Provider:
+        """
+        Return the provider at tier_idx, clamped to available tiers.
+        Gracefully degrades: if tier_idx > len(tiers)-1, returns the lightest.
+        """
+        idx = min(tier_idx, len(self.tiers) - 1)
+        return self.tiers[idx]
+
+    def num_tiers(self) -> int:
+        return len(self.tiers)
+
+    # ── Pool rotation (within the lowest tier or all tiers as fallback) ───────
+
     def next_provider(self) -> Provider:
-        """Return the provider whose best available key has the fewest calls."""
-        candidates = [p for p in self.providers if not p.all_exhausted()]
+        """Least-used available provider across all tiers (fallback path)."""
+        candidates = [p for p in self.tiers if not p.all_exhausted()]
         if not candidates:
             raise AllProvidersExhausted(
                 "All API keys are rate-limited. Please wait a moment or add more keys."
             )
-        return min(candidates, key=lambda p: p.best_key().calls)  # type: ignore[union-attr]
+        return min(candidates, key=lambda p: p.best_key().calls)  # type: ignore
 
     def any_available(self) -> bool:
-        return any(not p.all_exhausted() for p in self.providers)
+        return any(not p.all_exhausted() for p in self.tiers)
 
     def stats(self) -> list[dict]:
-        rows = []
-        if self.root_provider:
-            p = self.root_provider
-            rows.append({
+        return [
+            {
                 "name": p.name, "model": p.model,
                 "calls": p.calls, "errors": p.errors,
                 "keys": len(p.api_keys), "key_status": p.key_status(),
-            })
-        for p in self.providers:
-            rows.append({
-                "name": p.name, "model": p.model,
-                "calls": p.calls, "errors": p.errors,
-                "keys": len(p.api_keys), "key_status": p.key_status(),
-            })
-        return rows
+            }
+            for p in self.tiers
+        ]
 
 
 # Singleton
