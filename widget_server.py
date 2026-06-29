@@ -199,8 +199,11 @@ async def _run_task(task: str, cwd: str | None = None, request_id: str | None = 
     }
 
     output_dir = Path(cwd) if cwd else None
+    from agents.node import _is_project_task, _CONVERSATIONAL
+    # Conversational tasks get shallow depth — never need more than 1-2 agents
+    _max_depth = 5 if _is_project_task(task) else (1 if _CONVERSATIONAL.search(task) else 3)
     root = AgentNode(
-        task=task, depth=0, max_depth=5,
+        task=task, depth=0, max_depth=_max_depth,
         output_dir=output_dir,
         sudo_callback=sudo_callback,
         on_shell_run=on_shell_run,

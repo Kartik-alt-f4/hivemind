@@ -212,15 +212,29 @@ async def _exec_command(
 
 # ── Task type detection ───────────────────────────────────────────────────────
 
+# Must have an explicit software/code deliverable signal
 _PROJECT_HINTS = re.compile(
-    r"\b(build|create|write|implement|design|generate|make|produce|develop|draft|"
-    r"plan|outline|code|script|report|document|file|project|deliverable|setup|"
-    r"refactor|migrate|analyse|analyze|research)\b",
+    r"\b(build|implement|develop|refactor|migrate|setup|scaffold|"
+    r"write|create|make|generate|"
+    r"code|program|script|module|function|class|api|cli|server|app|"
+    r"website|webpage|frontend|backend|database|pipeline)\b",
+    re.IGNORECASE,
+)
+
+# Conversational/knowledge tasks — never treat as project even if other hints match
+_CONVERSATIONAL = re.compile(
+    r"\b(recipe|cook|food|eat|drink|meal|ingredient|marinade|how do|"
+    r"what is|what are|explain|tell me|give me|can i|should i|why|"
+    r"help me understand|difference between|compare|recommend|suggest|"
+    r"idea|opinion|advice|tips?|trick|hack|joke|story|poem|haiku|"
+    r"translate|summarize|summarise|list|pros|cons)\b",
     re.IGNORECASE,
 )
 
 def _is_project_task(task: str) -> bool:
-    """True if the task expects a concrete deliverable rather than a conversational answer."""
+    """True only if the task explicitly requests a software/code deliverable."""
+    if _CONVERSATIONAL.search(task):
+        return False
     return bool(_PROJECT_HINTS.search(task)) and len(task.split()) > 6
 
 
