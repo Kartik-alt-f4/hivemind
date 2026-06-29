@@ -3,8 +3,15 @@ Agent Node — recursive unit of the HiveMind cluster.
 Markers: ##SPLIT##, ##SOLVE##, ##CLARIFY##, ##RUN##
 Project tasks get a shared workspace .md file all agents read/write.
 ##RUN## lets agents execute shell commands; sudo is routed to the user.
+
+Inter-agent context passing:
+  Parent nodes pass structured JSON context to children embedded in the
+  task string:  {"task": "...", "context": {...}}
+  Children parse this on receipt so they inherit project_root, known_files,
+  parent findings, and shell rules — eliminating path guessing.
 """
 import asyncio
+import json
 import re
 import subprocess
 import time
@@ -14,7 +21,7 @@ import datetime
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Callable
-from core.llm import chat
+from core.llm import chat  # prefer_merge=True for synthesis passes; pool models for leaf solves
 
 try:
     import ray
@@ -54,9 +61,9 @@ def _make_task_id(parent_id: Optional[str], child_index: int) -> str:
 
 # ── Workspace helpers ─────────────────────────────────────────────────────────
 
-def _workspace_path(root_task: str) -> pathlib.Path:
+def _workspace_path(root_task: str, base_dir: Optional[pathlib.Path] = None) -> pathlib.Path:
     slug = re.sub(r"[^a-z0-9]+", "_", root_task.lower())[:48].strip("_")
-    ws = pathlib.Path("hivemind_workspace")
+    ws = (base_dir or pathlib.Path.cwd()) / "hivemind_workspace"
     ws.mkdir(exist_ok=True)
     return ws / f"{slug}.md"
 
@@ -84,6 +91,11 @@ _FENCED_FILE = re.compile(
     r"```(?:[\w.+-]*\s+)?(?:#\s*)?(?:file:\s*)?([^\n`]+\.[a-zA-Z0-9]+)\n(.*?)```",
     re.DOTALL,
 )
+# Heading immediately before a fenced block: ### filename.ext\n```lang\n...\n```
+_HEADING_FENCED = re.compile(
+    r"#{1,4}\s+([^\n`]+\.[a-zA-Z0-9]+)\s*\n```[\w]*\n(.*?)```",
+    re.DOTALL,
+)
 _FENCED_LANG = re.compile(
     r"```(\w+)\n(.*?)```",
     re.DOTALL,
@@ -93,49 +105,59 @@ _LANG_EXT = {
     "typescript": "ts", "ts": "ts", "bash": "sh", "sh": "sh",
     "html": "html", "css": "css", "json": "json", "yaml": "yml",
     "toml": "toml", "rust": "rs", "go": "go", "c": "c", "cpp": "cpp",
+    "text": "txt",
 }
 
 def _extract_and_write_files(result: str, output_dir: pathlib.Path, root_task: str) -> list[pathlib.Path]:
     """
     Scan result text for fenced code blocks and write them as files.
+    Handles three patterns:
+      1. ```python filename.py  (filename on opening fence line)
+      2. ### filename.py\\n```python  (markdown heading before fence)
+      3. ```python  (unnamed — slug fallback, only if nothing else matched)
     Returns list of paths written.
     """
     written: list[pathlib.Path] = []
     seen_names: set[str] = set()
 
-    # First pass: blocks with explicit filenames (```python snake.py or ```# snake.py)
-    for m in _FENCED_FILE.finditer(result):
-        fname = m.group(1).strip().lstrip("#").strip()
-        code = m.group(2)
-        # Accept plain filenames and relative subpaths (src/css/style.css)
-        # Reject bare language tags (no dot) and anything with spaces
-        if "." in fname and " " not in fname:
-            path = output_dir / fname
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(code)
-            written.append(path)
-            seen_names.add(fname)
+    def _write(fname: str, code: str):
+        fname = fname.strip().lstrip("#").strip()
+        if "." not in fname or " " in fname:
+            return
+        # Reject bare language names mistaken for filenames
+        if fname.split(".")[-1] not in _LANG_EXT.values() and \
+           fname.split(".")[-1] not in {"py","js","ts","html","css","json","yml","yaml","sh","md","txt","rs","go","c","cpp","toml"}:
+            return
+        if fname in seen_names:
+            return
+        seen_names.add(fname)
+        path = output_dir / fname
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(code)
+        written.append(path)
 
-    # Second pass: language-tagged blocks — derive filename from task if only one block
+    # Pass 1: inline filename on fence opening line  (```python job.py)
+    for m in _FENCED_FILE.finditer(result):
+        _write(m.group(1), m.group(2))
+
+    # Pass 2: markdown heading before fence  (### job.py\n```python\n...)
     if not written:
-        blocks = _FENCED_LANG.findall(result)
-        if blocks:
-            slug = re.sub(r"[^a-z0-9]+", "_", root_task.lower())[:32].strip("_")
-            for lang, code in blocks:
-                ext = _LANG_EXT.get(lang.lower())
-                if not ext:
-                    continue
-                fname = f"{slug}.{ext}"
-                # avoid collisions if multiple blocks of same type
-                base, n = fname, 1
-                while fname in seen_names:
-                    fname = f"{base[:-len(ext)-1]}_{n}.{ext}"
-                    n += 1
-                seen_names.add(fname)
-                path = output_dir / fname
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(code)
-                written.append(path)
+        for m in _HEADING_FENCED.finditer(result):
+            _write(m.group(1), m.group(2))
+
+    # Pass 3: unnamed language blocks — slug fallback
+    if not written:
+        slug = re.sub(r"[^a-z0-9]+", "_", root_task.lower())[:32].strip("_")
+        for lang, code in _FENCED_LANG.findall(result):
+            ext = _LANG_EXT.get(lang.lower())
+            if not ext:
+                continue
+            fname = f"{slug}.{ext}"
+            base, n = slug, 1
+            while fname in seen_names:
+                fname = f"{base}_{n}.{ext}"
+                n += 1
+            _write(fname, code)
 
     return written
 
@@ -202,6 +224,79 @@ def _is_project_task(task: str) -> bool:
     return bool(_PROJECT_HINTS.search(task)) and len(task.split()) > 6
 
 
+# ── Structured context helpers ────────────────────────────────────────────────
+
+def _parse_task_json(raw: str) -> tuple[str, dict]:
+    """
+    If raw is a JSON object with a 'task' key, extract task string + context dict.
+    Otherwise return raw as-is with empty context.
+    """
+    raw = raw.strip()
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict) and "task" in obj:
+                return obj["task"], obj.get("context", {})
+        except json.JSONDecodeError:
+            pass
+    return raw, {}
+
+
+def _build_task_json(task: str, context: dict) -> str:
+    """Wrap a subtask string with its inherited context as a JSON payload."""
+    if not context:
+        return task
+    return json.dumps({"task": task, "context": context}, ensure_ascii=False)
+
+
+async def _discover_context(output_dir: Optional[pathlib.Path], task: str = "") -> dict:
+    """
+    Run lightweight shell discovery to build an initial context dict for the
+    root node. Finds source files and returns structured metadata children
+    can use instead of guessing paths.
+    """
+    # Try to extract an explicit absolute path from the task description first
+    import re as _re
+    path_match = _re.search(r"(/(?:home|usr|var|opt|tmp|root|mnt|srv|projects?|workspace)[^\s,;\"']+)", task)
+    if path_match:
+        candidate = pathlib.Path(path_match.group(1))
+        if candidate.is_dir():
+            cwd = str(candidate)
+        else:
+            cwd = str(output_dir or pathlib.Path.cwd())
+    else:
+        cwd = str(output_dir or pathlib.Path.cwd())
+    context: dict = {
+        "project_root": cwd,
+        "cwd": cwd,
+        "known_files": [],
+        "findings": "",
+        "constraints": [
+            "Always use absolute paths based on project_root. The known_files list contains real paths — use them directly with cat/grep/find.",
+            "To read a file: ##RUN## cat <project_root>/<relative_path>. Do NOT write scripts or install packages to read files.",
+            "If a ##RUN## command returns 'No such file or directory' or non-zero exit, immediately run: find <project_root> -name '<filename>' to locate the correct path. Do NOT write your answer until the file has been successfully read.",
+            "Never fabricate file contents. If you cannot read a file, say so explicitly.",
+            "Do NOT install packages (pip, npm, etc.) to accomplish exploration tasks. Use shell builtins: cat, grep, find, head, wc.",
+        ],
+    }
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            f"find {cwd} -type f -not -path '*/.git/*' -not -path '*/node_modules/*' "
+            f"-not -path '*/build/*' -not -path '*/__pycache__/*' "
+            f"| grep -E '\\.(js|ts|jsx|tsx|py|json|sql|md|yaml|yml|sh|kt)$' "
+            f"| sort | head -80",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        files = [l for l in stdout.decode(errors="replace").splitlines() if l.strip()]
+        context["known_files"] = files
+        _debug_log(f"[context] discovered {len(files)} files in {cwd}")
+    except Exception as e:
+        _debug_log(f"[context] discovery failed: {e}")
+    return context
+
+
 # ── Agent Node ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -232,15 +327,23 @@ class AgentNode:
     sudo_callback: Optional[Callable] = None         # async (cmd) -> password | None
     on_shell_run: Optional[Callable] = None          # async (cmd, output) -> None, for logging
 
+    # Structured context passed from parent → child as JSON in the task string
+    # Shape: {project_root, known_files, cwd, findings, constraints}
+    task_context: dict = field(default_factory=dict)
+
     def __post_init__(self):
         _agent_registry[self.agent_id] = self
         self.task_id = _make_task_id(self.parent_id, self.child_index)
+        # Parse JSON task payload — child agents receive {"task":..., "context":...}
+        raw_task, inherited_ctx = _parse_task_json(self.task)
+        self.task = raw_task
+        if inherited_ctx and not self.task_context:
+            self.task_context = inherited_ctx
         if not self.root_task:
             self.root_task = self.task
         if self.depth == 0:
             self.is_project = _is_project_task(self.task)
-            if self.is_project:
-                self.workspace_path = _workspace_path(self.root_task)
+            # workspace_path is set lazily in _plan() once output_dir is known
 
     def _emit(self):
         if self.on_update:
@@ -334,47 +437,61 @@ class AgentNode:
 
     async def _execute_runs(self, answer: str) -> str:
         """
-        Find ##RUN## blocks in the answer, execute each command, replace the
-        marker with the output, then ask the LLM to continue from the results.
-        Returns the (possibly enriched) answer.
+        Execute ##RUN## blocks iteratively. After each command the LLM sees the
+        output and may emit more ##RUN## blocks — this enables multi-step shell
+        exploration (read a file, decide what to read next, etc.).
+        Caps at 12 iterations to prevent runaway loops.
         """
-        runs = _RUN_MARKER.findall(answer)
-        if not runs:
-            return answer
+        messages: list[dict] = []
+        current = answer
+        MAX_ITERS = 12
 
-        run_results: list[str] = []
-        for cmd in runs:
-            cmd = cmd.strip()
-            if not cmd:
-                continue
-            _debug_log(f"[{self.task_id}] SHELL: {cmd}")
-            output = await _exec_command(cmd, self.output_dir, self.sudo_callback)
-            run_results.append(f"$ {cmd}\n{output}")
-            if self.on_shell_run:
-                await self.on_shell_run(cmd, output)
+        for _ in range(MAX_ITERS):
+            runs = _RUN_MARKER.findall(current)
+            if not runs:
+                break
 
-        if not run_results:
-            return answer
+            run_results: list[str] = []
+            for cmd in runs:
+                cmd = cmd.strip()
+                if not cmd:
+                    continue
+                _debug_log(f"[{self.task_id}] SHELL: {cmd}")
+                output = await _exec_command(cmd, self.output_dir, self.sudo_callback)
+                run_results.append(f"$ {cmd}\n{output}")
+                if self.on_shell_run:
+                    await self.on_shell_run(cmd, output)
 
-        # Strip the ##RUN## blocks from the answer
-        clean = _RUN_MARKER.sub("", answer).strip()
-        run_block = "\n\n".join(run_results)
+            if not run_results:
+                break
 
-        # Ask the LLM to interpret the output and complete its response
-        followup = await chat(
-            [{"role": "user", "content": (
-                f"You ran these shell commands as part of your task:\n\n"
-                f"{run_block}\n\n"
-                f"Your partial answer so far:\n{clean}\n\n"
-                f"Continue your answer incorporating the command output. "
-                f"If the commands succeeded, confirm it. If they failed, explain and suggest a fix."
-            )}],
-            system="You are a HiveMind agent completing a task after running shell commands. Be concise.",
-            temperature=0.3,
-            max_tokens=1024,
-            depth=self.depth,
-        )
-        return f"{clean}\n\n{followup}".strip()
+            clean = _RUN_MARKER.sub("", current).strip()
+            run_block = "\n\n".join(run_results)
+
+            # Feed output back and let LLM continue — may emit more ##RUN## blocks
+            messages.append({"role": "user", "content": (
+                f"Shell output:\n{run_block}\n\n"
+                f"Your answer so far:\n{clean}\n\n"
+                "Continue. You may run more ##RUN## commands to explore further, "
+                "or write your final answer without ##RUN## to finish."
+            )})
+
+            current = await chat(
+                messages,
+                system=(
+                    "You are a HiveMind agent. You have shell access via ##RUN## blocks. "
+                    "Use it iteratively to explore, read files, and gather information. "
+                    "When you have enough information, write your complete final answer without any ##RUN## blocks."
+                ),
+                temperature=0.3,
+                max_tokens=2048,
+                depth=self.depth,
+                max_depth=self.max_depth,
+                prefer_root=True,
+            )
+            messages.append({"role": "assistant", "content": current})
+
+        return current
 
     async def _design_pass(self) -> tuple[str, int]:
         """
@@ -383,28 +500,63 @@ class AgentNode:
         child agents share the same blueprint.
         Returns (design_doc_text, file_count).
         """
-        system = (
-            "You are HiveMind's ARCHITECT agent. Before any code is written, "
-            "produce a thorough design document for the task.\n\n"
-            "Your design doc must cover:\n"
-            "1. COMPLETE list of files to create, each with its exact filename and responsibility\n"
-            "2. Key data structures / interfaces between files\n"
-            "3. Edge cases and error handling requirements\n"
-            "4. Visual/UX ambition — for web projects: layout, color scheme, animations, responsiveness\n"
-            "5. Any shell commands needed (chmod, mkdir, pip install, etc.)\n"
-            "6. How to verify the result works\n\n"
-            "Be specific, concrete, and AMBITIOUS. More files = more specialisation = better result. "
-            "For a webpage, split HTML structure, CSS styling, JS logic, data files, and assets into separate files. "
-            "End your doc with a line formatted exactly as: FILES: N (where N is the total number of files to create). "
-            "This document will be given to every agent — they will implement EXACTLY what you specify. "
-            "Do NOT write any code yet. Only produce the design."
+        # Detect if this is an exploration/documentation task vs a construction task
+        _EXPLORE_HINTS = re.compile(
+            r"\b(explore|read|analyse|analyze|audit|review|document|summarize|summarise|"
+            r"explain|describe|investigate|examine|inspect|catalog|catalogue)\b",
+            re.IGNORECASE,
         )
+        _BUILD_HINTS = re.compile(
+            r"\b(build|create|implement|develop|code|script|refactor|migrate|setup|make)\b",
+            re.IGNORECASE,
+        )
+        is_exploration = bool(_EXPLORE_HINTS.search(self.root_task)) and not bool(_BUILD_HINTS.search(self.root_task))
+
+        if is_exploration:
+            # For exploration tasks, known_files tells us what source files exist
+            known = ""
+            if self.task_context and self.task_context.get("known_files"):
+                files = self.task_context["known_files"][:50]
+                known = "\n\nKnown project files (use these exact paths with cat/grep):\n" + "\n".join(f"  {f}" for f in files)
+            system = (
+                "You are HiveMind's ARCHITECT agent planning an EXPLORATION task — not code generation.\n\n"
+                "Your job: produce a research plan that lists which source files to read and what to extract from each.\n\n"
+                "Your plan must:\n"
+                "1. List the key source files to read (use cat with full absolute paths — never guess paths)\n"
+                "2. For each file, state exactly what information to extract\n"
+                "3. Describe the output document structure\n"
+                "4. RULE: Agents must use ##RUN## cat <path> to read files. No pip installs. No writing scripts. Just cat, grep, find.\n\n"
+                "End your plan with a line formatted exactly as: FILES: N (where N is the number of source files to read, each becoming one subtask)."
+                + known
+            )
+            user_content = f"Plan the exploration for:\n\n{self.root_task}"
+        else:
+            system = (
+                "You are HiveMind's ARCHITECT agent. Before any code is written, "
+                "produce a thorough design document for the task.\n\n"
+                "Your design doc must cover:\n"
+                "1. COMPLETE list of files to create, each with its exact filename and responsibility\n"
+                "2. Key data structures / interfaces between files\n"
+                "3. Edge cases and error handling requirements\n"
+                "4. Visual/UX ambition — for web projects: layout, color scheme, animations, responsiveness\n"
+                "5. Any shell commands needed (chmod, mkdir, pip install, etc.)\n"
+                "6. How to verify the result works\n\n"
+                "Be specific, concrete, and AMBITIOUS. More files = more specialisation = better result. "
+                "For a webpage, split HTML structure, CSS styling, JS logic, data files, and assets into separate files. "
+                "End your doc with a line formatted exactly as: FILES: N (where N is the total number of files to create). "
+                "This document will be given to every agent — they will implement EXACTLY what you specify. "
+                "Do NOT write any code yet. Only produce the design."
+            )
+            user_content = f"Design a complete, ambitious implementation plan for:\n\n{self.root_task}"
+
         design = await chat(
-            [{"role": "user", "content": f"Design a complete, ambitious implementation plan for:\n\n{self.root_task}"}],
+            [{"role": "user", "content": user_content}],
             system=system,
             temperature=0.2,
             max_tokens=1500,
             depth=0,
+            max_depth=self.max_depth,
+            prefer_root=True,  # ARCHITECT is always tier 0
         )
 
         # Parse file count from design doc
@@ -427,8 +579,9 @@ class AgentNode:
         return await chat(
             [{"role": "user", "content": f"Task: {self.task}\n\nSolve this completely.{ws_context}"}],
             system="You are a HiveMind agent. Answer the task directly and completely.",
-            temperature=0.5, max_tokens=2048, depth=self.depth,
-            prefer_root=self.is_project,
+            temperature=0.5, max_tokens=2048,
+            depth=self.depth, max_depth=self.max_depth,
+            prefer_root=True,  # force solve = leaf node = tier 0 (bottom of V)
         )
 
     async def _plan(self) -> str:
@@ -437,7 +590,11 @@ class AgentNode:
 
         budget = self._budget()
 
-        # Root node: initialise workspace, run design pass, then plan
+        # Lazily initialise workspace path now that output_dir is known
+        if self.depth == 0 and self.is_project and self.workspace_path is None:
+            self.workspace_path = _workspace_path(self.root_task, self.output_dir)
+
+        # Root node: initialise workspace, discover context, run design pass
         if self.depth == 0 and self.is_project and self.workspace_path:
             _write_workspace(
                 self.workspace_path,
@@ -446,8 +603,22 @@ class AgentNode:
                 f"**Started:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
                 f"---\n\n*Agent results will appear below, labeled by task ID (task, task.1, task.1.1, …)*\n"
             )
-            # Design pass — write architecture doc before any splits/solves
-            _, self._design_file_count = await self._design_pass()
+            # Discover project structure so children inherit real paths
+            if not self.task_context:
+                self.task_context = await _discover_context(self.output_dir, self.task)
+            # For exploration tasks, skip ARCHITECT and let root split directly using known_files
+            _EXPLORE_RE = re.compile(
+                r"\b(explore|read|analyse|analyze|audit|review|document|summarize|summarise|"
+                r"explain|describe|investigate|examine|inspect|catalog|catalogue)\b",
+                re.IGNORECASE,
+            )
+            _BUILD_RE = re.compile(
+                r"\b(build|create|implement|develop|code|script|refactor|migrate|setup|make)\b",
+                re.IGNORECASE,
+            )
+            self._is_exploration = bool(_EXPLORE_RE.search(self.task)) and not bool(_BUILD_RE.search(self.task))
+            if not self._is_exploration:
+                _, self._design_file_count = await self._design_pass()
 
         # Read workspace context if available
         ws_context = ""
@@ -469,6 +640,28 @@ class AgentNode:
         if self.parent_id:
             id_ctx += f"PARENT: {self.parent_id}\n"
 
+        # Inject structured context from parent (or root discovery)
+        ctx_block = ""
+        if self.task_context:
+            ctx = self.task_context
+            lines = ["CONTEXT (from parent node — use this, do not guess):"]
+            if ctx.get("project_root"):
+                lines.append(f"  project_root: {ctx['project_root']}")
+            if ctx.get("cwd"):
+                lines.append(f"  cwd: {ctx['cwd']}")
+            if ctx.get("known_files"):
+                files_preview = ctx["known_files"][:40]
+                lines.append(f"  known_files ({len(ctx['known_files'])} total, first {len(files_preview)} shown):")
+                for f in files_preview:
+                    lines.append(f"    {f}")
+            if ctx.get("findings"):
+                lines.append(f"  parent_findings: {ctx['findings']}")
+            if ctx.get("constraints"):
+                lines.append("  RULES (hard constraints — follow exactly):")
+                for c in ctx["constraints"]:
+                    lines.append(f"    • {c}")
+            ctx_block = "\n" + "\n".join(lines) + "\n"
+
         file_hint = (
             "\n\nWhen your answer includes code, wrap each file in a fenced block with its filename on the opening line, e.g.:\n"
             "```python snake.py\n<code>\n```\n"
@@ -477,13 +670,34 @@ class AgentNode:
 
         if self.depth == 0:
             file_count = getattr(self, "_design_file_count", 3)
-            project_note = (
-                f"This is a CODING/PROJECT task. A design document has been written to the workspace — READ IT in full before splitting.\n"
-                f"The design specifies {file_count} files. You MUST produce exactly {file_count} subtasks, one per file.\n"
-                f"Each subtask must name the specific file it will create and implement it completely — do not collapse multiple files into one subtask.\n"
-                f"Do NOT use ##SOLVE## — the split is mandatory. More agents = higher quality output.\n"
-                f"Be AMBITIOUS: each agent should produce polished, complete, production-quality work for its file.\n"
-            ) if self.is_project else "For simple/conversational tasks, solve directly.\n"
+            is_exploration = getattr(self, "_is_exploration", False)
+            if is_exploration and self.task_context and self.task_context.get("known_files"):
+                # Exploration mode: split into cat/grep subtasks over real files
+                key_files = [
+                    f for f in self.task_context["known_files"]
+                    if any(f.endswith(ext) for ext in (".js", ".ts", ".py", ".json", ".sql", ".md", ".yaml", ".yml"))
+                    and "node_modules" not in f and "__pycache__" not in f
+                ][:12]
+                project_root = self.task_context.get("project_root", "")
+                files_list = "\n".join(f"  - {f}" for f in key_files)
+                project_note = (
+                    f"This is an EXPLORATION/DOCUMENTATION task. DO NOT write code or install packages.\n"
+                    f"Split into subtasks where each subtask reads one or more real source files using ##RUN## cat <path>.\n"
+                    f"The following files exist in the project (use these EXACT paths):\n{files_list}\n"
+                    f"project_root: {project_root}\n"
+                    f"Each subtask should: read the file(s), extract the relevant information, and return a structured section for the final document.\n"
+                    f"You MUST use ##SPLIT## — do NOT ##SOLVE## this yourself. Split into {min(len(key_files), 6)} subtasks covering different parts of the codebase.\n"
+                )
+            elif self.is_project:
+                project_note = (
+                    f"This is a CODING/PROJECT task. A design document has been written to the workspace — READ IT in full before splitting.\n"
+                    f"The design specifies {file_count} files. You MUST produce exactly {file_count} subtasks, one per file.\n"
+                    f"Each subtask must name the specific file it will create and implement it completely — do not collapse multiple files into one subtask.\n"
+                    f"Do NOT use ##SOLVE## — the split is mandatory. More agents = higher quality output.\n"
+                    f"Be AMBITIOUS: each agent should produce polished, complete, production-quality work for its file.\n"
+                )
+            else:
+                project_note = "For simple/conversational tasks, solve directly.\n"
             system = (
                 "You are HiveMind — a recursive multi-agent AI cluster.\n"
                 + id_ctx
@@ -494,14 +708,28 @@ class AgentNode:
                 + file_hint
             )
         else:
+            # At leaf depth (max_depth-1) always solve; otherwise always split into 2
+            is_leaf_depth = self.depth >= self.max_depth - 1
+            if is_leaf_depth:
+                split_instruction = (
+                    "You are at leaf depth — always use ##SOLVE##. Implement your subtask completely.\n"
+                )
+            else:
+                splits_remaining = self.max_depth - self.depth - 1
+                split_instruction = (
+                    f"You MUST use ##SPLIT## — split your subtask into exactly 2 independent sub-parts.\n"
+                    f"Do NOT use ##SOLVE## at this depth ({self.depth}/{self.max_depth}). "
+                    f"Each of your children will split again ({splits_remaining} more level(s) before leaf).\n"
+                    "Name each sub-part precisely so it is fully self-contained and independently implementable.\n"
+                    "Children will be assigned IDs extending yours (e.g. if you are task.2, children are task.2.1, task.2.2).\n"
+                )
             system = (
                 f"You are a HiveMind agent (depth {self.depth}/{self.max_depth}).\n"
                 + id_ctx
                 + root_ctx
-                + "The workspace contains a DESIGN DOCUMENT — read it carefully and implement exactly what it specifies for your subtask.\n"
-                "Solve atomically if possible. Split only if your subtask has truly independent parts.\n"
-                "If you split, your children will be assigned IDs extending your own (e.g. if you are task.2, children are task.2.1, task.2.2).\n"
-                + ("depth>=3: always ##SOLVE##.\n" if self.depth >= 3 else "")
+                + ctx_block
+                + "The workspace contains a DESIGN DOCUMENT — read it carefully before acting.\n"
+                + split_instruction
                 + budget_note
                 + file_hint
             )
@@ -514,9 +742,15 @@ class AgentNode:
             + "\n\nWithin a ##SOLVE## answer you MAY run shell commands by embedding:\n"
             "##RUN##\n<single shell command>\n"
             "The command will be executed and its output fed back to you. "
-            "Use this for: chmod, mkdir, pip install, moving files, or verifying output. "
-            "Never use ##RUN## for commands requiring interactive input. "
-            "If the command needs sudo, write it normally — the user will be prompted for their password securely and it will never be shown to you.\n"
+            "Use ##RUN## freely to explore, read, and understand — treat it like a terminal:\n"
+            "  - Explore structure: find . -type f -name '*.js' | head -40\n"
+            "  - Read files: cat path/to/file.js\n"
+            "  - Search code: grep -r 'functionName' src/\n"
+            "  - Understand deps: cat package.json\n"
+            "  - Run/verify: python3 script.py, chmod, pip install, etc.\n"
+            "You may chain multiple ##RUN## blocks in sequence — each runs and feeds back before you continue. "
+            "Never use ##RUN## for interactive commands. "
+            "If the command needs sudo, write it normally — the user will be prompted securely.\n"
             "\nNothing else."
         )
 
@@ -525,13 +759,16 @@ class AgentNode:
         # Coding tasks need more tokens and the strongest model available
         plan_tokens = 2000 if self.is_project else 600
 
+        # V-shape: depth 0 and leaf nodes → tier 0; middle depths → lighter tiers
+        is_leaf_solve = "##SOLVE##" in system or self.depth >= self.max_depth - 1
         response = await chat(
             [{"role": "user", "content": user_msg}],
             system=system,
             temperature=0.3,
             max_tokens=plan_tokens,
             depth=self.depth,
-            prefer_root=self.is_project,  # coding agents use root model
+            max_depth=self.max_depth,
+            prefer_root=(self.depth == 0 or is_leaf_solve),
         )
 
         _debug_log(f"[{self.task_id}] depth={self.depth} budget={budget} | {response[:120].strip()}")
@@ -576,9 +813,22 @@ class AgentNode:
             _debug_log(f"[{self.task_id}] BUDGET TRIM {len(subtasks)}→{budget}")
             subtasks = subtasks[:budget]
 
+        # Non-root agents always split into exactly 2 for a balanced binary tree
+        if self.depth > 0 and len(subtasks) != 2:
+            if len(subtasks) > 2:
+                _debug_log(f"[{self.task_id}] BINARY TRIM {len(subtasks)}→2")
+                subtasks = subtasks[:2]
+            elif len(subtasks) == 1:
+                # Can't split 1 item — solve directly
+                self.result = await self._force_solve()
+                self.status = AgentStatus.DONE
+                self._emit()
+                return
+
         self.children = [
             AgentNode(
-                task=st,
+                task=_build_task_json(st, self.task_context),
+                task_context=self.task_context,
                 depth=self.depth + 1,
                 parent_id=self.task_id,
                 child_index=i,
@@ -666,6 +916,7 @@ class AgentNode:
             "6. End with a concise '## How to run' section.\n"
             "Do not summarise or truncate — output the full content of every file."
         )
+        # V-shape going back up: depth 0 merge → tier 0, deeper merges → lighter
         result = await chat(
             [{"role": "user", "content": (
                 f"Original task: {self.task}\n\n"
@@ -674,9 +925,10 @@ class AgentNode:
             )}],
             system=system,
             depth=self.depth,
+            max_depth=self.max_depth,
             temperature=0.3,
             max_tokens=4000,
-            prefer_root=self.is_project,  # merge pass needs the strongest model
+            prefer_merge=True,
         )
 
         # Root node finalises workspace with tree summary

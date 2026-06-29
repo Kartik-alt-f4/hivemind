@@ -173,6 +173,19 @@ async def _run_task(task: str, cwd: str | None = None, request_id: str | None = 
     async def on_shell_run(cmd: str, output: str):
         await event_q.put({"type": "shell_run", "cmd": cmd, "output": output})
 
+    def on_update(node) -> None:
+        """Emit a node_update event whenever an agent changes state."""
+        event_q.put_nowait({
+            "type": "node_update",
+            "task_id": node.task_id,
+            "parent_id": node.parent_id,
+            "task": node.task[:80],
+            "state": node.status.value,
+            "depth": node.depth,
+            "child_ids": [c.task_id for c in node.children],
+            "elapsed": round(node.elapsed(), 1),
+        })
+
     yield {"type": "status", "text": "planning…"}
 
     # Snapshot call counts before the run so we can compute per-request deltas
@@ -191,19 +204,24 @@ async def _run_task(task: str, cwd: str | None = None, request_id: str | None = 
         output_dir=output_dir,
         sudo_callback=sudo_callback,
         on_shell_run=on_shell_run,
+        on_update=on_update,
     )
     semaphore = asyncio.Semaphore(8)
 
-    # Run the agent tree; drain event_q and send keep-alive pings every 0.5s
+    # Run the agent tree; drain event_q frequently for near-real-time updates
     run_task = asyncio.create_task(root.run(semaphore))
+    heartbeat_counter = 0
     try:
         while not run_task.done():
-            done, _ = await asyncio.wait({run_task}, timeout=0.5)
-            # Flush any shell/sudo events that arrived
+            done, _ = await asyncio.wait({run_task}, timeout=0.05)
+            # Flush all queued events immediately (node_update, shell_run, sudo)
             while not event_q.empty():
                 yield event_q.get_nowait()
-            if not done:
+            # Send a heartbeat every ~1s so client knows we're alive
+            heartbeat_counter += 1
+            if heartbeat_counter >= 20 and not done:
                 yield {"type": "status", "text": "working…"}
+                heartbeat_counter = 0
         # Final flush
         while not event_q.empty():
             yield event_q.get_nowait()
