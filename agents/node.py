@@ -708,15 +708,28 @@ class AgentNode:
                 + file_hint
             )
         else:
+            # At leaf depth (max_depth-1) always solve; otherwise always split into 2
+            is_leaf_depth = self.depth >= self.max_depth - 1
+            if is_leaf_depth:
+                split_instruction = (
+                    "You are at leaf depth — always use ##SOLVE##. Implement your subtask completely.\n"
+                )
+            else:
+                splits_remaining = self.max_depth - self.depth - 1
+                split_instruction = (
+                    f"You MUST use ##SPLIT## — split your subtask into exactly 2 independent sub-parts.\n"
+                    f"Do NOT use ##SOLVE## at this depth ({self.depth}/{self.max_depth}). "
+                    f"Each of your children will split again ({splits_remaining} more level(s) before leaf).\n"
+                    "Name each sub-part precisely so it is fully self-contained and independently implementable.\n"
+                    "Children will be assigned IDs extending yours (e.g. if you are task.2, children are task.2.1, task.2.2).\n"
+                )
             system = (
                 f"You are a HiveMind agent (depth {self.depth}/{self.max_depth}).\n"
                 + id_ctx
                 + root_ctx
                 + ctx_block
-                + "The workspace contains a DESIGN DOCUMENT — read it carefully and implement exactly what it specifies for your subtask.\n"
-                "Solve atomically if possible. Split only if your subtask has truly independent parts.\n"
-                "If you split, your children will be assigned IDs extending your own (e.g. if you are task.2, children are task.2.1, task.2.2).\n"
-                + ("depth>=3: always ##SOLVE##.\n" if self.depth >= 3 else "")
+                + "The workspace contains a DESIGN DOCUMENT — read it carefully before acting.\n"
+                + split_instruction
                 + budget_note
                 + file_hint
             )
@@ -799,6 +812,18 @@ class AgentNode:
         if len(subtasks) > budget:
             _debug_log(f"[{self.task_id}] BUDGET TRIM {len(subtasks)}→{budget}")
             subtasks = subtasks[:budget]
+
+        # Non-root agents always split into exactly 2 for a balanced binary tree
+        if self.depth > 0 and len(subtasks) != 2:
+            if len(subtasks) > 2:
+                _debug_log(f"[{self.task_id}] BINARY TRIM {len(subtasks)}→2")
+                subtasks = subtasks[:2]
+            elif len(subtasks) == 1:
+                # Can't split 1 item — solve directly
+                self.result = await self._force_solve()
+                self.status = AgentStatus.DONE
+                self._emit()
+                return
 
         self.children = [
             AgentNode(

@@ -131,7 +131,7 @@ if _RICH:
             return Panel(self.render(), title=title, border_style="cyan", padding=(0, 1))
 
 
-SERVER_URL  = "http://localhost:7779"
+SERVER_URL  = os.environ.get("HIVEMIND_SERVER", "http://localhost:7779")
 SERVER_BIN  = Path(__file__).parent / "widget_server.py"
 VENV_PYTHON = Path(__file__).parent / ".venv" / "bin" / "python3"
 HISTORY_FILE = Path.home() / ".local" / "share" / "hivemind" / "history.json"
