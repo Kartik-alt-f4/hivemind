@@ -98,7 +98,8 @@ def _print_dim(msg: str):
 
 def _print_error(msg: str):
     if _RICH:
-        console.print(f"[bold red]✗[/bold red] {msg}")
+        from rich.markup import escape
+        console.print(f"[bold red]✗[/bold red] {escape(msg)}")
     else:
         print(f"✗ {msg}", file=sys.stderr)
 
@@ -197,8 +198,9 @@ def run_task(task: str, history: list[dict]) -> str | None:
                         cmd_str = msg.get("cmd", "")
                         out_str = msg.get("output", "")
                         if _RICH:
-                            console.print(f"\n[dim]$ {cmd_str}[/dim]")
-                            console.print(f"[dim]{out_str}[/dim]")
+                            from rich.markup import escape
+                            console.print(f"\n[dim]$ {escape(cmd_str)}[/dim]")
+                            console.print(f"[dim]{escape(out_str)}[/dim]")
                         else:
                             print(f"\n$ {cmd_str}\n{out_str}")
                         stop_spinner.clear()
@@ -210,7 +212,8 @@ def run_task(task: str, history: list[dict]) -> str | None:
                         cmd_str = msg.get("cmd", "")
                         sudo_req_id = msg.get("request_id", req_id)
                         if _RICH:
-                            console.print(f"\n[yellow]⚠ sudo required for:[/yellow] [dim]{cmd_str}[/dim]")
+                            from rich.markup import escape
+                            console.print(f"\n[yellow]⚠ sudo required for:[/yellow] [dim]{escape(cmd_str)}[/dim]")
                         else:
                             print(f"\nsudo required for: {cmd_str}")
                         try:

@@ -348,49 +348,61 @@ class AgentNode:
 
     async def _execute_runs(self, answer: str) -> str:
         """
-        Find ##RUN## blocks in the answer, execute each command, replace the
-        marker with the output, then ask the LLM to continue from the results.
-        Returns the (possibly enriched) answer.
+        Execute ##RUN## blocks iteratively. After each command the LLM sees the
+        output and may emit more ##RUN## blocks — this enables multi-step shell
+        exploration (read a file, decide what to read next, etc.).
+        Caps at 12 iterations to prevent runaway loops.
         """
-        runs = _RUN_MARKER.findall(answer)
-        if not runs:
-            return answer
+        messages: list[dict] = []
+        current = answer
+        MAX_ITERS = 12
 
-        run_results: list[str] = []
-        for cmd in runs:
-            cmd = cmd.strip()
-            if not cmd:
-                continue
-            _debug_log(f"[{self.task_id}] SHELL: {cmd}")
-            output = await _exec_command(cmd, self.output_dir, self.sudo_callback)
-            run_results.append(f"$ {cmd}\n{output}")
-            if self.on_shell_run:
-                await self.on_shell_run(cmd, output)
+        for _ in range(MAX_ITERS):
+            runs = _RUN_MARKER.findall(current)
+            if not runs:
+                break
 
-        if not run_results:
-            return answer
+            run_results: list[str] = []
+            for cmd in runs:
+                cmd = cmd.strip()
+                if not cmd:
+                    continue
+                _debug_log(f"[{self.task_id}] SHELL: {cmd}")
+                output = await _exec_command(cmd, self.output_dir, self.sudo_callback)
+                run_results.append(f"$ {cmd}\n{output}")
+                if self.on_shell_run:
+                    await self.on_shell_run(cmd, output)
 
-        # Strip the ##RUN## blocks from the answer
-        clean = _RUN_MARKER.sub("", answer).strip()
-        run_block = "\n\n".join(run_results)
+            if not run_results:
+                break
 
-        # Ask the LLM to interpret the output and complete its response
-        followup = await chat(
-            [{"role": "user", "content": (
-                f"You ran these shell commands as part of your task:\n\n"
-                f"{run_block}\n\n"
-                f"Your partial answer so far:\n{clean}\n\n"
-                f"Continue your answer incorporating the command output. "
-                f"If the commands succeeded, confirm it. If they failed, explain and suggest a fix."
-            )}],
-            system="You are a HiveMind agent completing a task after running shell commands. Be concise.",
-            temperature=0.3,
-            max_tokens=1024,
-            depth=self.depth,
-            max_depth=self.max_depth,
-            prefer_root=True,  # shell follow-up is a leaf-level solve, use tier 0
-        )
-        return f"{clean}\n\n{followup}".strip()
+            clean = _RUN_MARKER.sub("", current).strip()
+            run_block = "\n\n".join(run_results)
+
+            # Feed output back and let LLM continue — may emit more ##RUN## blocks
+            messages.append({"role": "user", "content": (
+                f"Shell output:\n{run_block}\n\n"
+                f"Your answer so far:\n{clean}\n\n"
+                "Continue. You may run more ##RUN## commands to explore further, "
+                "or write your final answer without ##RUN## to finish."
+            )})
+
+            current = await chat(
+                messages,
+                system=(
+                    "You are a HiveMind agent. You have shell access via ##RUN## blocks. "
+                    "Use it iteratively to explore, read files, and gather information. "
+                    "When you have enough information, write your complete final answer without any ##RUN## blocks."
+                ),
+                temperature=0.3,
+                max_tokens=2048,
+                depth=self.depth,
+                max_depth=self.max_depth,
+                prefer_root=True,
+            )
+            messages.append({"role": "assistant", "content": current})
+
+        return current
 
     async def _design_pass(self) -> tuple[str, int]:
         """
@@ -537,9 +549,15 @@ class AgentNode:
             + "\n\nWithin a ##SOLVE## answer you MAY run shell commands by embedding:\n"
             "##RUN##\n<single shell command>\n"
             "The command will be executed and its output fed back to you. "
-            "Use this for: chmod, mkdir, pip install, moving files, or verifying output. "
-            "Never use ##RUN## for commands requiring interactive input. "
-            "If the command needs sudo, write it normally — the user will be prompted for their password securely and it will never be shown to you.\n"
+            "Use ##RUN## freely to explore, read, and understand — treat it like a terminal:\n"
+            "  - Explore structure: find . -type f -name '*.js' | head -40\n"
+            "  - Read files: cat path/to/file.js\n"
+            "  - Search code: grep -r 'functionName' src/\n"
+            "  - Understand deps: cat package.json\n"
+            "  - Run/verify: python3 script.py, chmod, pip install, etc.\n"
+            "You may chain multiple ##RUN## blocks in sequence — each runs and feeds back before you continue. "
+            "Never use ##RUN## for interactive commands. "
+            "If the command needs sudo, write it normally — the user will be prompted securely.\n"
             "\nNothing else."
         )
 
