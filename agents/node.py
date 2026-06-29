@@ -84,6 +84,11 @@ _FENCED_FILE = re.compile(
     r"```(?:[\w.+-]*\s+)?(?:#\s*)?(?:file:\s*)?([^\n`]+\.[a-zA-Z0-9]+)\n(.*?)```",
     re.DOTALL,
 )
+# Heading immediately before a fenced block: ### filename.ext\n```lang\n...\n```
+_HEADING_FENCED = re.compile(
+    r"#{1,4}\s+([^\n`]+\.[a-zA-Z0-9]+)\s*\n```[\w]*\n(.*?)```",
+    re.DOTALL,
+)
 _FENCED_LANG = re.compile(
     r"```(\w+)\n(.*?)```",
     re.DOTALL,
@@ -93,49 +98,59 @@ _LANG_EXT = {
     "typescript": "ts", "ts": "ts", "bash": "sh", "sh": "sh",
     "html": "html", "css": "css", "json": "json", "yaml": "yml",
     "toml": "toml", "rust": "rs", "go": "go", "c": "c", "cpp": "cpp",
+    "text": "txt",
 }
 
 def _extract_and_write_files(result: str, output_dir: pathlib.Path, root_task: str) -> list[pathlib.Path]:
     """
     Scan result text for fenced code blocks and write them as files.
+    Handles three patterns:
+      1. ```python filename.py  (filename on opening fence line)
+      2. ### filename.py\\n```python  (markdown heading before fence)
+      3. ```python  (unnamed — slug fallback, only if nothing else matched)
     Returns list of paths written.
     """
     written: list[pathlib.Path] = []
     seen_names: set[str] = set()
 
-    # First pass: blocks with explicit filenames (```python snake.py or ```# snake.py)
-    for m in _FENCED_FILE.finditer(result):
-        fname = m.group(1).strip().lstrip("#").strip()
-        code = m.group(2)
-        # Accept plain filenames and relative subpaths (src/css/style.css)
-        # Reject bare language tags (no dot) and anything with spaces
-        if "." in fname and " " not in fname:
-            path = output_dir / fname
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(code)
-            written.append(path)
-            seen_names.add(fname)
+    def _write(fname: str, code: str):
+        fname = fname.strip().lstrip("#").strip()
+        if "." not in fname or " " in fname:
+            return
+        # Reject bare language names mistaken for filenames
+        if fname.split(".")[-1] not in _LANG_EXT.values() and \
+           fname.split(".")[-1] not in {"py","js","ts","html","css","json","yml","yaml","sh","md","txt","rs","go","c","cpp","toml"}:
+            return
+        if fname in seen_names:
+            return
+        seen_names.add(fname)
+        path = output_dir / fname
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(code)
+        written.append(path)
 
-    # Second pass: language-tagged blocks — derive filename from task if only one block
+    # Pass 1: inline filename on fence opening line  (```python job.py)
+    for m in _FENCED_FILE.finditer(result):
+        _write(m.group(1), m.group(2))
+
+    # Pass 2: markdown heading before fence  (### job.py\n```python\n...)
     if not written:
-        blocks = _FENCED_LANG.findall(result)
-        if blocks:
-            slug = re.sub(r"[^a-z0-9]+", "_", root_task.lower())[:32].strip("_")
-            for lang, code in blocks:
-                ext = _LANG_EXT.get(lang.lower())
-                if not ext:
-                    continue
-                fname = f"{slug}.{ext}"
-                # avoid collisions if multiple blocks of same type
-                base, n = fname, 1
-                while fname in seen_names:
-                    fname = f"{base[:-len(ext)-1]}_{n}.{ext}"
-                    n += 1
-                seen_names.add(fname)
-                path = output_dir / fname
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(code)
-                written.append(path)
+        for m in _HEADING_FENCED.finditer(result):
+            _write(m.group(1), m.group(2))
+
+    # Pass 3: unnamed language blocks — slug fallback
+    if not written:
+        slug = re.sub(r"[^a-z0-9]+", "_", root_task.lower())[:32].strip("_")
+        for lang, code in _FENCED_LANG.findall(result):
+            ext = _LANG_EXT.get(lang.lower())
+            if not ext:
+                continue
+            fname = f"{slug}.{ext}"
+            base, n = slug, 1
+            while fname in seen_names:
+                fname = f"{base}_{n}.{ext}"
+                n += 1
+            _write(fname, code)
 
     return written
 
