@@ -100,6 +100,10 @@ class TokenMeter:
 
 METER = TokenMeter()
 
+# ── Per-request sudo queues ───────────────────────────────────────────────────
+# Maps request_id -> asyncio.Queue that receives the password string from /sudo-input.
+_sudo_queues: dict[str, asyncio.Queue] = {}
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="HiveMind Widget Server", version="1.0")
 
@@ -123,17 +127,51 @@ async def health():
     except Exception as e:
         return {"ok": False, "error": str(e), "providers": [], "tokens": METER.snapshot()}
 
+# ── Sudo password injection ───────────────────────────────────────────────────
+@app.post("/sudo-input")
+async def sudo_input(body: dict):
+    """Receive a sudo password from hm and deliver it to the waiting agent."""
+    req_id = body.get("request_id", "")
+    password = body.get("password", "")
+    q = _sudo_queues.get(req_id)
+    if q is None:
+        return {"ok": False, "error": "no pending sudo request for that id"}
+    await q.put(password)
+    return {"ok": True}
+
 # ── Core task runner ──────────────────────────────────────────────────────────
-async def _run_task(task: str) -> AsyncIterator[dict]:
+async def _run_task(task: str, cwd: str | None = None, request_id: str | None = None) -> AsyncIterator[dict]:
     """Run a HiveMind task and yield status/result dicts as it progresses."""
+    import uuid as _uuid
     from agents.node import AgentNode, _agent_registry
     import agents.node as _node_module
     from core.providers import get_pool
+    from pathlib import Path
 
     # Reset global agent state between runs
     _node_module._agent_registry.clear()
 
     pool = get_pool()
+    req_id = request_id or _uuid.uuid4().hex
+
+    # Queue for sudo password responses from the client
+    sudo_q: asyncio.Queue = asyncio.Queue()
+    _sudo_queues[req_id] = sudo_q
+
+    # Messages from shell runs and sudo prompts are put here to be yielded
+    event_q: asyncio.Queue = asyncio.Queue()
+
+    async def sudo_callback(cmd: str) -> str | None:
+        """Pause execution, ask the client for a sudo password, wait for it."""
+        await event_q.put({"type": "sudo_prompt", "cmd": cmd, "request_id": req_id})
+        try:
+            password = await asyncio.wait_for(sudo_q.get(), timeout=120)
+            return password
+        except asyncio.TimeoutError:
+            return None
+
+    async def on_shell_run(cmd: str, output: str):
+        await event_q.put({"type": "shell_run", "cmd": cmd, "output": output})
 
     yield {"type": "status", "text": "planning…"}
 
@@ -147,17 +185,30 @@ async def _run_task(task: str) -> AsyncIterator[dict]:
         for k in s["key_status"]
     }
 
-    root = AgentNode(task=task, depth=0, max_depth=5)
+    output_dir = Path(cwd) if cwd else None
+    root = AgentNode(
+        task=task, depth=0, max_depth=5,
+        output_dir=output_dir,
+        sudo_callback=sudo_callback,
+        on_shell_run=on_shell_run,
+    )
     semaphore = asyncio.Semaphore(8)
 
-    # Run the agent tree; send keep-alive pings every 5s so the stream
-    # doesn't stall in curl/GLib while waiting for the blocking work.
+    # Run the agent tree; drain event_q and send keep-alive pings every 0.5s
     run_task = asyncio.create_task(root.run(semaphore))
-    ping_interval = 5.0
-    while not run_task.done():
-        done, _ = await asyncio.wait({run_task}, timeout=ping_interval)
-        if not done:
-            yield {"type": "status", "text": "working…"}
+    try:
+        while not run_task.done():
+            done, _ = await asyncio.wait({run_task}, timeout=0.5)
+            # Flush any shell/sudo events that arrived
+            while not event_q.empty():
+                yield event_q.get_nowait()
+            if not done:
+                yield {"type": "status", "text": "working…"}
+        # Final flush
+        while not event_q.empty():
+            yield event_q.get_nowait()
+    finally:
+        _sudo_queues.pop(req_id, None)
 
     try:
         run_task.result()
@@ -217,6 +268,10 @@ async def _run_task(task: str) -> AsyncIterator[dict]:
     }
     yield {"type": "result", "text": result_text}
 
+    files_written = getattr(root, "files_written", [])
+    if files_written:
+        yield {"type": "files", "paths": [str(f) for f in files_written]}
+
 # ── POST /chat — HTTP streaming ───────────────────────────────────────────────
 @app.post("/chat")
 async def chat_http(body: dict):
@@ -224,8 +279,11 @@ async def chat_http(body: dict):
     if not task:
         return {"error": "task is required"}
 
+    cwd = (body.get("cwd") or "").strip() or None
+    request_id = (body.get("request_id") or "").strip() or None
+
     async def stream():
-        async for msg in _run_task(task):
+        async for msg in _run_task(task, cwd=cwd, request_id=request_id):
             yield json.dumps(msg) + "\n"
 
     return StreamingResponse(
@@ -245,8 +303,10 @@ async def chat_ws(ws: WebSocket):
             if not task:
                 await ws.send_json({"type": "error", "text": "task is required"})
                 continue
+            cwd_ws = (data.get("cwd") or "").strip() or None
+            req_id_ws = (data.get("request_id") or "").strip() or None
 
-            async for msg in _run_task(task):
+            async for msg in _run_task(task, cwd=cwd_ws, request_id=req_id_ws):
                 await ws.send_json(msg)
 
     except WebSocketDisconnect:

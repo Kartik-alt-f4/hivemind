@@ -19,11 +19,12 @@ async def chat(
     max_tokens: int = 2048,
     provider: Provider | None = None,
     depth: int = 0,
+    prefer_root: bool = False,
 ) -> str:
     """
     Send a chat completion request. Returns the assistant's reply as a string.
     Picks the least-used available key across providers on each attempt.
-    When depth==0 and a root provider is configured, tries it first.
+    When depth==0 or prefer_root=True and a root provider is configured, tries it first.
     Raises AllProvidersExhausted when every key is rate-limited.
     """
     import sys
@@ -31,7 +32,7 @@ async def chat(
     delay = RETRY_DELAY
     last_error = "unknown"
 
-    use_root = depth == 0 and pool.root_provider is not None
+    use_root = (depth == 0 or prefer_root) and pool.root_provider is not None
     root_tried = False
 
     for attempt in range(MAX_RETRIES):

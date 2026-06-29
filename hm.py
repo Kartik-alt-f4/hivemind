@@ -14,6 +14,8 @@ import signal
 import subprocess
 import threading
 import argparse
+import uuid
+import getpass
 from pathlib import Path
 
 # ── Optional rich ─────────────────────────────────────────────────────────────
@@ -114,7 +116,7 @@ def _print_stats(agents: int, per_key: dict, tokens: int, key_health: dict):
     limited: set[str] = set()
     for keys in key_health.values():
         for k in keys:
-            if k.get("rate_limited"):
+            if k.get("rate_limited") and k.get("label"):
                 limited.add(k["label"])
 
     parts = [
@@ -138,12 +140,14 @@ def run_task(task: str, history: list[dict]) -> str | None:
     """
     import httpx
 
-    payload = {"task": task}
+    req_id = uuid.uuid4().hex
+    payload = {"task": task, "cwd": os.getcwd(), "request_id": req_id}
 
     spinner_text = ["status", ""]
     result_text: list[str] = []
     error_text:  list[str] = []
     stats_data:  list[dict] = []
+    files_written: list[str] = []
 
     # Spinner runs in a thread while we block on the stream
     stop_spinner = threading.Event()
@@ -185,6 +189,47 @@ def run_task(task: str, history: list[dict]) -> str | None:
                         error_text.append(msg.get("text", ""))
                     elif mtype == "usage":
                         stats_data.append(msg)
+                    elif mtype == "files":
+                        files_written.extend(msg.get("paths", []))
+                    elif mtype == "shell_run":
+                        stop_spinner.set()
+                        spin_thread.join(timeout=0.3)
+                        cmd_str = msg.get("cmd", "")
+                        out_str = msg.get("output", "")
+                        if _RICH:
+                            console.print(f"\n[dim]$ {cmd_str}[/dim]")
+                            console.print(f"[dim]{out_str}[/dim]")
+                        else:
+                            print(f"\n$ {cmd_str}\n{out_str}")
+                        stop_spinner.clear()
+                        spin_thread = threading.Thread(target=_spin, daemon=True)
+                        spin_thread.start()
+                    elif mtype == "sudo_prompt":
+                        stop_spinner.set()
+                        spin_thread.join(timeout=0.3)
+                        cmd_str = msg.get("cmd", "")
+                        sudo_req_id = msg.get("request_id", req_id)
+                        if _RICH:
+                            console.print(f"\n[yellow]⚠ sudo required for:[/yellow] [dim]{cmd_str}[/dim]")
+                        else:
+                            print(f"\nsudo required for: {cmd_str}")
+                        try:
+                            pw = getpass.getpass("  Password: ")
+                        except (KeyboardInterrupt, EOFError):
+                            pw = ""
+                        # Send password to server without it ever appearing in the stream
+                        import httpx as _httpx
+                        try:
+                            _httpx.post(
+                                f"{SERVER_URL}/sudo-input",
+                                json={"request_id": sudo_req_id, "password": pw},
+                                timeout=5,
+                            )
+                        except Exception:
+                            pass
+                        stop_spinner.clear()
+                        spin_thread = threading.Thread(target=_spin, daemon=True)
+                        spin_thread.start()
     except KeyboardInterrupt:
         stop_spinner.set()
         spin_thread.join(timeout=0.5)
@@ -205,6 +250,16 @@ def run_task(task: str, history: list[dict]) -> str | None:
 
     result = result_text[0] if result_text else ""
     _print_result(result)
+
+    if files_written:
+        if _RICH:
+            console.print("\n[bold green]Files written:[/bold green]")
+            for f in files_written:
+                console.print(f"  [green]✓[/green] {f}")
+        else:
+            print("\nFiles written:")
+            for f in files_written:
+                print(f"  ✓ {f}")
 
     if stats_data:
         s = stats_data[0]
