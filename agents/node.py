@@ -54,9 +54,9 @@ def _make_task_id(parent_id: Optional[str], child_index: int) -> str:
 
 # ── Workspace helpers ─────────────────────────────────────────────────────────
 
-def _workspace_path(root_task: str) -> pathlib.Path:
+def _workspace_path(root_task: str, base_dir: Optional[pathlib.Path] = None) -> pathlib.Path:
     slug = re.sub(r"[^a-z0-9]+", "_", root_task.lower())[:48].strip("_")
-    ws = pathlib.Path("hivemind_workspace")
+    ws = (base_dir or pathlib.Path.cwd()) / "hivemind_workspace"
     ws.mkdir(exist_ok=True)
     return ws / f"{slug}.md"
 
@@ -239,8 +239,7 @@ class AgentNode:
             self.root_task = self.task
         if self.depth == 0:
             self.is_project = _is_project_task(self.task)
-            if self.is_project:
-                self.workspace_path = _workspace_path(self.root_task)
+            # workspace_path is set lazily in _plan() once output_dir is known
 
     def _emit(self):
         if self.on_update:
@@ -437,6 +436,10 @@ class AgentNode:
             return await self._force_solve()
 
         budget = self._budget()
+
+        # Lazily initialise workspace path now that output_dir is known
+        if self.depth == 0 and self.is_project and self.workspace_path is None:
+            self.workspace_path = _workspace_path(self.root_task, self.output_dir)
 
         # Root node: initialise workspace, run design pass, then plan
         if self.depth == 0 and self.is_project and self.workspace_path:
