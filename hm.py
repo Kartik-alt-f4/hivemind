@@ -26,10 +26,110 @@ try:
     from rich.spinner import Spinner
     from rich.text import Text
     from rich.table import Table
+    from rich.panel import Panel
+    from rich.columns import Columns
     from rich import print as rprint
     _RICH = True
 except ImportError:
     _RICH = False
+
+# ── Live agent tree visualizer ────────────────────────────────────────────────
+if _RICH:
+    class AgentTree:
+        """
+        Tracks node_update events and renders a growing tree of agents.
+        States cycle through colours; completion 'flows' back up to the root.
+        """
+        # State → (icon, Rich color)
+        _STYLE = {
+            "pending":  ("○", "dim white"),
+            "planning": ("◎", "bold cyan"),
+            "running":  ("●", "bold yellow"),
+            "merging":  ("◈", "bold magenta"),
+            "done":     ("✓", "bold green"),
+            "error":    ("✗", "bold red"),
+        }
+        # Depth → indent colour gradient (dark → bright)
+        _DEPTH_COLOR = ["white", "cyan", "green", "yellow", "magenta", "blue"]
+
+        def __init__(self):
+            self._nodes: dict[str, dict] = {}   # task_id → node dict
+            self._lock = threading.Lock()
+            self._tick = 0  # animation frame counter
+
+        def update(self, msg: dict):
+            with self._lock:
+                tid = msg["task_id"]
+                if tid not in self._nodes:
+                    self._nodes[tid] = msg.copy()
+                else:
+                    self._nodes[tid].update(msg)
+
+        def _sorted_ids(self) -> list[str]:
+            """Return task IDs in tree order (depth-first by dotted ID)."""
+            def sort_key(tid: str):
+                parts = tid.split(".")
+                # "task" sorts first, then numerically by each segment
+                if parts[0] == "task" and len(parts) == 1:
+                    return []
+                return [int(p) if p.isdigit() else 0 for p in parts[1:]]
+            return sorted(self._nodes.keys(), key=sort_key)
+
+        def render(self) -> "Text":
+            self._tick += 1
+            spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            frame = spinner_frames[self._tick % len(spinner_frames)]
+
+            with self._lock:
+                if not self._nodes:
+                    return Text("  waiting for agents…", style="dim")
+
+                lines = Text()
+                ids = self._sorted_ids()
+                for tid in ids:
+                    node = self._nodes[tid]
+                    depth = node.get("depth", 0)
+                    state = node.get("state", "pending")
+                    task  = node.get("task", "")
+                    elapsed = node.get("elapsed", 0)
+
+                    icon, style = self._STYLE.get(state, ("?", "white"))
+                    depth_color = self._DEPTH_COLOR[min(depth, len(self._DEPTH_COLOR) - 1)]
+
+                    # Tree indent: connector lines
+                    if depth == 0:
+                        prefix = ""
+                    else:
+                        prefix = "  " * (depth - 1) + "└─ "
+
+                    # Animate spinner on active nodes
+                    if state in ("running", "planning", "merging"):
+                        icon = frame if state == "running" else icon
+
+                    # Truncate long task names
+                    max_task = max(20, 60 - len(prefix))
+                    short_task = task[:max_task] + ("…" if len(task) > max_task else "")
+
+                    elapsed_str = f" [{elapsed}s]" if elapsed > 0 else ""
+
+                    line = Text()
+                    line.append(prefix, style=f"dim {depth_color}")
+                    line.append(f"{icon} ", style=style)
+                    line.append(f"[{tid}]", style=f"bold {depth_color}")
+                    line.append(f" {short_task}", style="white" if state != "done" else "dim white")
+                    if elapsed_str:
+                        line.append(elapsed_str, style="dim")
+                    line.append("\n")
+                    lines.append_text(line)
+
+                return lines
+
+        def panel(self) -> "Panel":
+            total = len(self._nodes)
+            done  = sum(1 for n in self._nodes.values() if n.get("state") == "done")
+            title = f"[bold cyan]HiveMind Cluster[/bold cyan] [dim]({done}/{total} agents)[/dim]"
+            return Panel(self.render(), title=title, border_style="cyan", padding=(0, 1))
+
 
 SERVER_URL  = "http://localhost:7779"
 SERVER_BIN  = Path(__file__).parent / "widget_server.py"
@@ -137,38 +237,25 @@ def _print_stats(agents: int, per_key: dict, tokens: int, key_health: dict):
 def run_task(task: str, history: list[dict]) -> str | None:
     """
     Stream a task to the server. Returns the result text, or None on error.
-    Prints status/result to terminal as they arrive.
+    Shows a live growing tree of agents while work is in progress.
     """
     import httpx
+    from rich.markup import escape
 
     req_id = uuid.uuid4().hex
     payload = {"task": task, "cwd": os.getcwd(), "request_id": req_id}
 
-    spinner_text = ["status", ""]
-    result_text: list[str] = []
-    error_text:  list[str] = []
-    stats_data:  list[dict] = []
-    files_written: list[str] = []
+    result_text:   list[str]  = []
+    error_text:    list[str]  = []
+    stats_data:    list[dict] = []
+    files_written: list[str]  = []
+    # Shell/sudo events buffered while Live is active (printed after it exits)
+    deferred_shell: list[dict] = []
 
-    # Spinner runs in a thread while we block on the stream
-    stop_spinner = threading.Event()
+    tree = AgentTree() if _RICH else None
 
-    def _spin():
-        chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-        i = 0
-        while not stop_spinner.is_set():
-            label = spinner_text[0]
-            if sys.stderr.isatty():
-                print(f"\r\033[2m{chars[i % len(chars)]} {label}\033[0m  ", end="", flush=True, file=sys.stderr)
-            i += 1
-            time.sleep(0.08)
-        if sys.stderr.isatty():
-            print("\r\033[2K", end="", flush=True, file=sys.stderr)
-
-    spin_thread = threading.Thread(target=_spin, daemon=True)
-    spin_thread.start()
-
-    try:
+    def _stream_loop(live: "Live | None"):
+        nonlocal result_text, error_text
         with httpx.Client(timeout=None) as client:
             with client.stream("POST", f"{SERVER_URL}/chat", json=payload) as resp:
                 resp.raise_for_status()
@@ -182,8 +269,14 @@ def run_task(task: str, history: list[dict]) -> str | None:
                         continue
 
                     mtype = msg.get("type")
-                    if mtype == "status":
-                        spinner_text[0] = msg.get("text", "")
+                    if mtype == "node_update":
+                        if tree:
+                            tree.update(msg)
+                            if live:
+                                live.update(tree.panel())
+                    elif mtype == "status":
+                        if live:
+                            live.update(tree.panel())
                     elif mtype == "result":
                         result_text.append(msg.get("text", ""))
                     elif mtype == "error":
@@ -193,59 +286,48 @@ def run_task(task: str, history: list[dict]) -> str | None:
                     elif mtype == "files":
                         files_written.extend(msg.get("paths", []))
                     elif mtype == "shell_run":
-                        stop_spinner.set()
-                        spin_thread.join(timeout=0.3)
-                        cmd_str = msg.get("cmd", "")
-                        out_str = msg.get("output", "")
-                        if _RICH:
-                            from rich.markup import escape
-                            console.print(f"\n[dim]$ {escape(cmd_str)}[/dim]")
-                            console.print(f"[dim]{escape(out_str)}[/dim]")
-                        else:
-                            print(f"\n$ {cmd_str}\n{out_str}")
-                        stop_spinner.clear()
-                        spin_thread = threading.Thread(target=_spin, daemon=True)
-                        spin_thread.start()
+                        deferred_shell.append({"kind": "shell", **msg})
                     elif mtype == "sudo_prompt":
-                        stop_spinner.set()
-                        spin_thread.join(timeout=0.3)
+                        # Must handle sudo interactively — pause live and prompt
+                        if live:
+                            live.stop()
                         cmd_str = msg.get("cmd", "")
                         sudo_req_id = msg.get("request_id", req_id)
-                        if _RICH:
-                            from rich.markup import escape
-                            console.print(f"\n[yellow]⚠ sudo required for:[/yellow] [dim]{escape(cmd_str)}[/dim]")
-                        else:
-                            print(f"\nsudo required for: {cmd_str}")
+                        console.print(f"\n[yellow]⚠ sudo required for:[/yellow] [dim]{escape(cmd_str)}[/dim]")
                         try:
                             pw = getpass.getpass("  Password: ")
                         except (KeyboardInterrupt, EOFError):
                             pw = ""
-                        # Send password to server without it ever appearing in the stream
-                        import httpx as _httpx
                         try:
-                            _httpx.post(
+                            httpx.post(
                                 f"{SERVER_URL}/sudo-input",
                                 json={"request_id": sudo_req_id, "password": pw},
                                 timeout=5,
                             )
                         except Exception:
                             pass
-                        stop_spinner.clear()
-                        spin_thread = threading.Thread(target=_spin, daemon=True)
-                        spin_thread.start()
+                        if live:
+                            live.start()
+
+    try:
+        if _RICH and sys.stderr.isatty():
+            with Live(tree.panel(), console=console, refresh_per_second=8,
+                      vertical_overflow="visible") as live:
+                _stream_loop(live)
+        else:
+            _stream_loop(None)
     except KeyboardInterrupt:
-        stop_spinner.set()
-        spin_thread.join(timeout=0.5)
         print()
         return None
     except Exception as e:
-        stop_spinner.set()
-        spin_thread.join(timeout=0.5)
         _print_error(str(e))
         return None
-    finally:
-        stop_spinner.set()
-        spin_thread.join(timeout=0.5)
+
+    # Print deferred shell output after the live panel closes
+    if deferred_shell and _RICH:
+        for ev in deferred_shell:
+            console.print(f"\n[dim]$ {escape(ev.get('cmd', ''))}[/dim]")
+            console.print(f"[dim]{escape(ev.get('output', ''))}[/dim]")
 
     if error_text:
         _print_error(error_text[0])
