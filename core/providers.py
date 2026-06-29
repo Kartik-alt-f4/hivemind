@@ -101,6 +101,7 @@ class ProviderPool:
     def __init__(self):
         self.providers: list[Provider] = []
         self.root_provider: Optional[Provider] = None
+        self.merge_provider: Optional[Provider] = None  # heavy model for merge/integration
         self._lock = asyncio.Lock()
         self._load_providers()
 
@@ -114,11 +115,24 @@ class ProviderPool:
                 extra = {"HTTP-Referer": "https://github.com/hivemind", "X-Title": "HiveMind"}
             self.root_provider = _make_provider("ROOT", root_url, root_model, root_keys, extra)
 
+        # Optional dedicated merge provider (heavy model for synthesis passes)
+        merge_url  = os.environ.get("PROVIDER_MERGE_BASE_URL", "").strip()
+        merge_keys = os.environ.get("PROVIDER_MERGE_KEYS", "").strip()
+        if merge_url and merge_keys:
+            merge_model = os.environ.get("PROVIDER_MERGE_MODEL", "gpt-4o").strip()
+            extra_m: dict[str, str] = {}
+            if "openrouter.ai" in merge_url:
+                extra_m = {"HTTP-Referer": "https://github.com/hivemind", "X-Title": "HiveMind"}
+            self.merge_provider = _make_provider("MERGE", merge_url, merge_model, merge_keys, extra_m)
+        else:
+            # Fall back to root provider for merge passes
+            self.merge_provider = self.root_provider
+
         seen: set[str] = set()
         for key in os.environ:
             if key.startswith("PROVIDER_") and key.endswith("_BASE_URL"):
                 name = key[len("PROVIDER_"):-len("_BASE_URL")]
-                if name in seen or name == "ROOT":
+                if name in seen or name in ("ROOT", "MERGE"):
                     continue
                 seen.add(name)
 

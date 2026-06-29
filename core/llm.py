@@ -20,11 +20,13 @@ async def chat(
     provider: Provider | None = None,
     depth: int = 0,
     prefer_root: bool = False,
+    prefer_merge: bool = False,
 ) -> str:
     """
     Send a chat completion request. Returns the assistant's reply as a string.
     Picks the least-used available key across providers on each attempt.
-    When depth==0 or prefer_root=True and a root provider is configured, tries it first.
+    When depth==0 or prefer_root=True, uses root provider.
+    When prefer_merge=True, uses the merge provider (heavy model for synthesis).
     Raises AllProvidersExhausted when every key is rate-limited.
     """
     import sys
@@ -32,13 +34,21 @@ async def chat(
     delay = RETRY_DELAY
     last_error = "unknown"
 
-    use_root = (depth == 0 or prefer_root) and pool.root_provider is not None
+    # Tier routing: merge > root > pool
+    if prefer_merge and pool.merge_provider is not None:
+        use_provider = pool.merge_provider
+    elif (depth == 0 or prefer_root) and pool.root_provider is not None:
+        use_provider = pool.root_provider
+    else:
+        use_provider = None  # use pool rotation
+
+    use_root = use_provider is not None
     root_tried = False
 
     for attempt in range(MAX_RETRIES):
         # Pick provider + key
         if use_root and not root_tried:
-            p = pool.root_provider
+            p = use_provider
             root_tried = True
             api_key = p.best_key() or p.api_keys[0]
         elif provider is not None:
@@ -86,8 +96,8 @@ async def chat(
                     f"({sum(1 for k in p.api_keys if k.is_available())} keys left in provider)\033[0m",
                     file=sys.stderr,
                 )
-                if p is pool.root_provider:
-                    print(f"\033[2m[llm] root provider 429 — falling back to pool\033[0m", file=sys.stderr)
+                if use_root and p is use_provider:
+                    print(f"\033[2m[llm] {p.name} provider 429 — falling back to pool\033[0m", file=sys.stderr)
                 if not pool.any_available():
                     raise AllProvidersExhausted(
                         "All API keys are currently rate-limited. "
@@ -105,8 +115,8 @@ async def chat(
                 except Exception:
                     detail = resp.text[:200]
                 last_error = f"400 from {p.name}: {detail}"
-                if p is pool.root_provider:
-                    print(f"\033[2m[llm] root provider 400 — falling back to pool\033[0m", file=sys.stderr)
+                if use_root and p is use_provider:
+                    print(f"\033[2m[llm] {p.name} provider 400 — falling back to pool\033[0m", file=sys.stderr)
                 provider = None
                 continue
 
@@ -121,8 +131,8 @@ async def chat(
         except (httpx.ConnectError, httpx.TimeoutException, KeyError) as e:
             p.errors += 1
             last_error = str(e)
-            if p is pool.root_provider:
-                print(f"\033[2m[llm] root provider error ({e.__class__.__name__}) — falling back\033[0m", file=sys.stderr)
+            if use_root and p is use_provider:
+                print(f"\033[2m[llm] {p.name} provider error ({e.__class__.__name__}) — falling back\033[0m", file=sys.stderr)
             if attempt == MAX_RETRIES - 1:
                 raise RuntimeError(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
             await asyncio.sleep(delay)

@@ -14,7 +14,7 @@ import datetime
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Callable
-from core.llm import chat
+from core.llm import chat  # prefer_merge=True for synthesis passes; pool models for leaf solves
 
 try:
     import ray
@@ -405,6 +405,7 @@ class AgentNode:
             temperature=0.2,
             max_tokens=1500,
             depth=0,
+            prefer_merge=True,  # architecture pass uses the heaviest model
         )
 
         # Parse file count from design doc
@@ -525,13 +526,14 @@ class AgentNode:
         # Coding tasks need more tokens and the strongest model available
         plan_tokens = 2000 if self.is_project else 600
 
+        # Root orchestration uses root model; leaf solves use pool (light models going down)
         response = await chat(
             [{"role": "user", "content": user_msg}],
             system=system,
             temperature=0.3,
             max_tokens=plan_tokens,
             depth=self.depth,
-            prefer_root=self.is_project,  # coding agents use root model
+            prefer_root=(self.depth == 0),  # only root orchestrator gets the heavy model going down
         )
 
         _debug_log(f"[{self.task_id}] depth={self.depth} budget={budget} | {response[:120].strip()}")
@@ -676,7 +678,7 @@ class AgentNode:
             depth=self.depth,
             temperature=0.3,
             max_tokens=4000,
-            prefer_root=self.is_project,  # merge pass needs the strongest model
+            prefer_merge=True,  # merge/synthesis passes always get the heaviest model
         )
 
         # Root node finalises workspace with tree summary
