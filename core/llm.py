@@ -135,8 +135,16 @@ async def chat(
 
             resp.raise_for_status()
             data = resp.json()
+            content = data["choices"][0]["message"].get("content") if data.get("choices") else None
+            if not content:
+                # Empty completion (e.g. Gemini max_tokens too tight) — treat as 400
+                p.errors += 1
+                last_error = f"empty completion from {p.name} (finish_reason={data['choices'][0].get('finish_reason','?')})"
+                print(f"\033[2m[llm] {p.name} empty response — falling back\033[0m", file=sys.stderr)
+                provider = None
+                continue
             api_key.calls += 1
-            return data["choices"][0]["message"]["content"]
+            return content
 
         except AllProvidersExhausted:
             raise
