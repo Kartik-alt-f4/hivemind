@@ -807,8 +807,9 @@ class AgentNode:
     # ── Merge (shape-aware, role-aware) ───────────────────────────────────────
 
     async def _merge(self, model_class: ModelClass, is_file_owner: bool = False) -> str:
-        # Cap each child result to avoid 413s on large trees
-        MAX_CHILD_CHARS = 3000
+        # Cap each child result — Groq free tier has ~6K token body limit
+        # 800 chars/child × 6 children + system + task ≈ 5K tokens (safe)
+        MAX_CHILD_CHARS = 800
         child_results = "\n\n".join(
             f"### [{c.task_id}] {c.task}\n{c.result[:MAX_CHILD_CHARS]}"
             + ("…[truncated]" if len(c.result) > MAX_CHILD_CHARS else "")

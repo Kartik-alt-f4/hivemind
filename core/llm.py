@@ -122,14 +122,14 @@ async def chat(
                 provider = None
                 continue
 
-            if resp.status_code == 400:
+            if resp.status_code in (400, 401, 413):
                 p.errors += 1
                 try:
                     detail = resp.json()
                 except Exception:
                     detail = resp.text[:200]
-                last_error = f"400 from {p.name}: {detail}"
-                print(f"\033[2m[llm] {p.name} 400 — falling back\033[0m", file=sys.stderr)
+                last_error = f"{resp.status_code} from {p.name}: {detail}"
+                print(f"\033[2m[llm] {p.name} {resp.status_code} — falling back\033[0m", file=sys.stderr)
                 provider = None
                 continue
 
