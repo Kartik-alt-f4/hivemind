@@ -116,7 +116,7 @@ def _append_workspace(path: pathlib.Path, section: str, content: str):
 # ── File extraction ───────────────────────────────────────────────────────────
 
 _FENCED_FILE = re.compile(
-    r"```(?:[\w.+-]*\s+)?(?:#\s*)?(?:file:\s*)?([^\n`]+\.[a-zA-Z0-9]+)\n(.*?)```",
+    r"```(?:[\w.+-]*?\s*)?(?:#\s*)?(?:file:\s*)?([^\n`\s][^\n`]*\.[a-zA-Z0-9]+)\n(.*?)```",
     re.DOTALL,
 )
 _HEADING_FENCED = re.compile(
@@ -260,15 +260,21 @@ You are HiveMind's Orchestrator. Classify the user's task and decide how to hand
 Reply with valid JSON ONLY — no preamble, no explanation.
 
 Classification rules:
-  "simple"     — Can be answered in one pass by a single agent.
-                 Examples: Q&A, explanations, short writing, single-file scripts,
-                 conversation, guides, summaries.
+  "simple"     — The work itself can be done in one short pass by a single agent.
+                 Examples: Q&A, explanations, fixing a function, short essays,
+                 a quick utility script (< ~80 lines), conversation, summaries.
   "ambiguous"  — The task is unclear, missing critical info, or could mean very
                  different things. Ask ONE clarifying question.
-  "complex"    — Requires multiple distinct output files or independent domain
-                 areas that genuinely benefit from parallel specialist agents.
-                 Examples: multi-file codebases, large multi-section documents,
-                 research tasks spanning multiple independent topics.
+  "complex"    — The work has genuinely independent subsystems or sections that
+                 benefit from parallel specialist agents — regardless of whether
+                 the final output is one file or many.
+                 Examples: games (board, rules, UI, game loop are independent),
+                 compilers/interpreters, multi-section documents, full web apps,
+                 any program whose subsystems can be built and tested in isolation.
+
+  CRITICAL: "output is one file" does NOT mean simple. A chess engine, a web
+  server, a language interpreter — these are complex even in one file because
+  they have independent subsystems. Judge by the WORK, not the output count.
 
 For "simple":
   {"route": "simple", "model_class": "worker"}
@@ -282,7 +288,7 @@ For "complex":
     "output_shape": "<single_file|multi_file|document|analysis>",
     "file_owners": [
       {
-        "domain": "Short label for this owner's area (e.g. 'game_logic.py')",
+        "domain": "Short label for this owner's area (e.g. 'move_generation')",
         "task": "What this file-owner agent is responsible for producing.",
         "workers": [
           {
@@ -295,18 +301,19 @@ For "complex":
   }
 
 output_shape guide:
-  single_file  — all output goes into one file
+  single_file  — all output assembles into one file (e.g. a chess game, a web page)
   multi_file   — output is multiple distinct named files
   document     — prose output (report, README, guide, essay)
   analysis     — structured analysis/conclusions (no filler prose)
 
 Rules for "complex":
   • Minimum 2 file_owners, maximum 6.
-  • Each file_owner has 1-4 workers. Workers write specific functions/sections.
-  • Keep workers focused and independent — no cross-dependencies within a file_owner.
-  • file_owners are run in parallel; workers within each file_owner run in parallel.
-  • Only use "complex" when parallel work genuinely speeds up a non-trivial task.
-    A single Python script, a short essay, or a step-by-step guide is SIMPLE.
+  • Each file_owner owns one logical subsystem and has 1-4 workers.
+  • Workers write specific, self-contained functions or sections — small enough
+    to complete in one pass (~50-150 lines of code or equivalent prose).
+  • file_owners run in parallel; workers within each file_owner run in parallel.
+  • For single_file output: file_owners each own a logical section/module of the
+    final file. The assembly happens at merge time — workers just write their piece.
 """
 
 
@@ -367,19 +374,31 @@ async def _orchestrate(task: str) -> dict:
 
 def _merge_system(shape: OutputShape, is_file_owner: bool = False) -> tuple[str, int]:
     """Return (system_prompt, max_tokens) tuned to the output shape."""
-    if shape in (OutputShape.SINGLE_FILE, OutputShape.MULTI_FILE):
+    if shape == OutputShape.SINGLE_FILE:
         prompt = (
             "You are HiveMind's assembly agent. Combine the worker outputs into "
-            "a complete, working output.\n"
+            "one complete, working file.\n"
             "RULES:\n"
-            "1. Assemble code VERBATIM — do not paraphrase or rewrite logic.\n"
-            "2. Do NOT merge multiple files into one.\n"
-            "3. Output EVERY file in its own fenced block with filename on the opening line:\n"
-            "   ```python filename.py\n   <code>\n   ```\n"
-            "4. Fix import conflicts or duplicate definitions, but change nothing else.\n"
+            "1. Assemble ALL worker code into a single fenced block with the filename:\n"
+            "   ```python chess.py\n   <full combined code>\n   ```\n"
+            "2. Preserve every function and class VERBATIM — do not rewrite logic.\n"
+            "3. Order sections logically (imports → data structures → functions → main).\n"
+            "4. Remove duplicate imports or definitions — keep one copy.\n"
             "5. End with a brief '## How to run' section."
         )
-        tokens = 4000
+        tokens = 6000
+    elif shape == OutputShape.MULTI_FILE:
+        prompt = (
+            "You are HiveMind's assembly agent. Combine the worker outputs into "
+            "complete, working files.\n"
+            "RULES:\n"
+            "1. Output EACH file in its own fenced block with filename on the opening line:\n"
+            "   ```python filename.py\n   <code>\n   ```\n"
+            "2. Assemble code VERBATIM — do not paraphrase or rewrite logic.\n"
+            "3. Fix import conflicts or duplicate definitions, but change nothing else.\n"
+            "4. End with a brief '## How to run' section."
+        )
+        tokens = 5000
     elif shape == OutputShape.DOCUMENT:
         if is_file_owner:
             prompt = (
@@ -745,11 +764,13 @@ class AgentNode:
             + domain_context
             + file_hint
         )
+        # Workers on code/file tasks need more room than prose agents
+        _max_tok = 3500 if self.role == AgentRole.WORKER else 2048
         return await chat(
             [{"role": "user", "content": f"Task: {self.task}{ws_context}"}],
             system=system,
             temperature=0.4,
-            max_tokens=2048,
+            max_tokens=_max_tok,
             model_class=model_class,
         )
 
@@ -807,9 +828,14 @@ class AgentNode:
     # ── Merge (shape-aware, role-aware) ───────────────────────────────────────
 
     async def _merge(self, model_class: ModelClass, is_file_owner: bool = False) -> str:
-        # Cap each child result — Groq free tier has ~6K token body limit
-        # 800 chars/child × 6 children + system + task ≈ 5K tokens (safe)
-        MAX_CHILD_CHARS = 800
+        # For code assembly (single_file/multi_file) we need the actual code verbatim.
+        # For prose shapes, cap tightly to stay under Groq's 6K token body limit.
+        # single_file with ≤4 workers: 1500 chars each ≈ 6K total (just within limit)
+        # For larger trees, Gemini ORC (no body limit) handles the merge.
+        if self.output_shape in (OutputShape.SINGLE_FILE, OutputShape.MULTI_FILE):
+            MAX_CHILD_CHARS = 1500
+        else:
+            MAX_CHILD_CHARS = 800
         child_results = "\n\n".join(
             f"### [{c.task_id}] {c.task}\n{c.result[:MAX_CHILD_CHARS]}"
             + ("…[truncated]" if len(c.result) > MAX_CHILD_CHARS else "")

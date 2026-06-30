@@ -122,7 +122,7 @@ async def chat(
                 provider = None
                 continue
 
-            if resp.status_code in (400, 401, 413):
+            if resp.status_code in (400, 401, 413, 503):
                 p.errors += 1
                 try:
                     detail = resp.json()
