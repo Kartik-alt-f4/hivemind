@@ -120,9 +120,7 @@ async def health():
     try:
         from core.providers import get_pool
         pool = get_pool()
-        providers = [p.name for p in pool.providers]
-        if pool.root_provider:
-            providers = ["ROOT"] + providers
+        providers = [f"{p.name}({p.model_class.value})" for p in pool.tiers]
         return {"ok": True, "providers": providers, "tokens": METER.snapshot()}
     except Exception as e:
         return {"ok": False, "error": str(e), "providers": [], "tokens": METER.snapshot()}

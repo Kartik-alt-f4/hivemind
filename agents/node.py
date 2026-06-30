@@ -33,15 +33,7 @@ from enum import Enum
 from typing import Optional, Callable
 
 from core.llm import chat
-from core.model_classes import ModelClass, class_for_task_type, TASK_TYPE_TO_CLASS
-
-try:
-    import ray
-    _RAY_AVAILABLE = True
-except ImportError:
-    _RAY_AVAILABLE = False
-
-RAY_THRESHOLD = 4
+from core.model_classes import ModelClass
 
 
 def _debug_log(msg: str):
@@ -404,10 +396,9 @@ class AgentNode:
         if route == "simple":
             self.status = AgentStatus.RUNNING
             self._emit()
-            answer = await self._solve_direct(
-                model_class=_safe_model_class(plan.get("model_class", "worker")),
-            )
-            answer = await self._execute_runs(answer)
+            mc = _safe_model_class(plan.get("model_class", "worker"))
+            answer = await self._solve_direct(model_class=mc)
+            answer = await self._execute_runs(answer, model_class=mc)
             self.result = answer
             self.status = AgentStatus.DONE
             self._emit()
@@ -473,12 +464,12 @@ class AgentNode:
             + ", ".join(f"{c.task_id}({c.model_class.value})" for c in self.children)
         )
 
-        # Check for sequential dependencies
-        sequential_indices = {
-            i for i, st in enumerate(subtasks) if st.get("sequential")
-        }
-        if sequential_indices:
-            _debug_log(f"[{self.task_id}] sequential subtasks: {sequential_indices}")
+        # If the orchestrator marked any subtask as sequential, run all in order.
+        # This is intentionally conservative: partial ordering isn't tracked,
+        # so any dependency flag means the whole batch must be sequential.
+        run_sequential = any(st.get("sequential") for st in subtasks)
+        if run_sequential:
+            _debug_log(f"[{self.task_id}] running {len(self.children)} subtasks sequentially")
             for child in self.children:
                 await child.run(semaphore)
         else:
@@ -499,7 +490,7 @@ class AgentNode:
         # Subtasks at depth >= max_depth always solve directly
         if self.depth >= self.max_depth:
             answer = await self._solve_direct(model_class=self.model_class)
-            answer = await self._execute_runs(answer)
+            answer = await self._execute_runs(answer, model_class=self.model_class)
             self.result = answer
             self.status = AgentStatus.DONE
             self._emit()
@@ -545,7 +536,7 @@ class AgentNode:
             else:
                 # Model wrote its answer inline without a marker
                 answer = decision.strip()
-            answer = await self._execute_runs(answer)
+            answer = await self._execute_runs(answer, model_class=self.model_class)
             if self.workspace_path:
                 _append_workspace(self.workspace_path, self.task_id, answer)
             self.result = answer
@@ -628,11 +619,15 @@ class AgentNode:
                 t = line[2:].strip()
                 if t:
                     subtasks.append(t)
+        # Cap at 3 — subtasks should not fan out uncontrollably mid-tree
+        subtasks = subtasks[:3]
         return subtasks if len(subtasks) >= 2 else []
 
     # ── Shell execution ───────────────────────────────────────────────────────
 
-    async def _execute_runs(self, answer: str) -> str:
+    async def _execute_runs(self, answer: str,
+                             model_class: Optional[ModelClass] = None) -> str:
+        mc = model_class or self.model_class
         messages: list[dict] = []
         current = answer
         MAX_ITERS = 12
@@ -673,7 +668,7 @@ class AgentNode:
                 ),
                 temperature=0.3,
                 max_tokens=2048,
-                model_class=self.model_class,
+                model_class=mc,
             )
             messages.append({"role": "assistant", "content": current})
 
