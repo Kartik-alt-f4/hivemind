@@ -311,8 +311,7 @@ class AgentNode:
     # Model class assigned by the orchestrator for this node's work
     model_class: ModelClass = ModelClass.WORKER
 
-    max_depth: int = 4       # lowered default; orchestrator sets per-task
-    min_complexity: int = 3  # kept for compat, not used for routing
+    max_depth: int = 4
     on_update: Optional[Callable] = None
 
     is_project: bool = False
@@ -320,7 +319,7 @@ class AgentNode:
     output_dir: Optional[pathlib.Path] = None
     sudo_callback: Optional[Callable] = None
     on_shell_run: Optional[Callable] = None
-    task_context: dict = field(default_factory=dict)
+    files_written: list[pathlib.Path] = field(default_factory=list)
 
     def __post_init__(self):
         _agent_registry[self.agent_id] = self
@@ -364,16 +363,13 @@ class AgentNode:
 
         # Write output files at root
         if self.depth == 0 and self.result and not self.result.startswith("[ERROR]"):
-            if not getattr(self, "files_written", []):
+            if not self.files_written:
                 out = self.output_dir or pathlib.Path.cwd()
                 self.files_written = _extract_and_write_files(
                     self.result, out, self.root_task
                 )
-            for f in getattr(self, "files_written", []):
+            for f in self.files_written:
                 _debug_log(f"[{self.task_id}] FILE WRITTEN: {f}")
-        else:
-            if not hasattr(self, "files_written"):
-                self.files_written: list[pathlib.Path] = []
 
         return None
 
@@ -731,30 +727,3 @@ class AgentNode:
         for child in self.children:
             nodes.extend(child.all_nodes())
         return nodes
-
-
-# ── Backwards compat: _is_project_task and _CONVERSATIONAL imported by widget_server.py ──
-
-_CONVERSATIONAL = re.compile(
-    r"\b(recipe|cook|food|eat|drink|meal|ingredient|marinade|how do|"
-    r"what is|what are|explain|tell me|give me|can i|should i|why|"
-    r"help me understand|difference between|compare|recommend|suggest|"
-    r"idea|opinion|advice|tips?|trick|hack|joke|story|poem|haiku|"
-    r"translate|summarize|summarise|list|pros|cons|guide|tutorial|"
-    r"newbie|beginner|intro|overview|basics|cheat.?sheet)\b",
-    re.IGNORECASE,
-)
-
-_PROJECT_HINTS = re.compile(
-    r"\b(build|implement|develop|refactor|migrate|setup|scaffold|"
-    r"write|create|make|generate|"
-    r"code|program|script|module|function|class|api|cli|server|app|"
-    r"website|webpage|frontend|backend|database|pipeline)\b",
-    re.IGNORECASE,
-)
-
-
-def _is_project_task(task: str) -> bool:
-    if _CONVERSATIONAL.search(task):
-        return False
-    return bool(_PROJECT_HINTS.search(task)) and len(task.split()) > 6

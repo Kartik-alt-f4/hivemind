@@ -19,7 +19,6 @@ if the preferred class is exhausted or unconfigured:
 """
 import os
 import time
-import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 from dotenv import load_dotenv
@@ -140,7 +139,6 @@ class ProviderPool:
     def __init__(self):
         # class → list of providers, best first
         self._by_class: dict[ModelClass, list[Provider]] = {mc: [] for mc in ModelClass}
-        self._lock = asyncio.Lock()
         self._load_providers()
 
     def _load_providers(self):
