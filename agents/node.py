@@ -450,7 +450,6 @@ class AgentNode:
                 output_dir=self.output_dir,
                 sudo_callback=self.sudo_callback,
                 on_shell_run=self.on_shell_run,
-                task_context=self.task_context,
             )
             for i, st in enumerate(subtasks)
         ]
@@ -513,7 +512,6 @@ class AgentNode:
                     output_dir=self.output_dir,
                     sudo_callback=self.sudo_callback,
                     on_shell_run=self.on_shell_run,
-                    task_context=self.task_context,
                 )
                 for i, st in enumerate(subtasks)
             ]
