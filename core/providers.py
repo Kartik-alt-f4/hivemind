@@ -1,21 +1,21 @@
 """
 Provider Pool Manager
-Loads providers from .env and organises them into quality tiers.
+Loads providers from .env and maps them to ModelClass buckets.
 
-Tier ordering (0 = strongest, N = lightest):
-  PROVIDER_ROOT_*   → tier 0  (root plan + leaf solves + final merge)
-  PROVIDER_TIER1_*  → tier 1  (one level in from root/leaf)
-  PROVIDER_TIER2_*  → tier 2  (two levels in)
-  ...
-  PROVIDER_*        → lowest tier (any remaining named providers)
+.env convention:
+  CLASS_<NAME>_BASE_URL  = https://...
+  CLASS_<NAME>_MODEL     = model-id
+  CLASS_<NAME>_KEYS      = key1,key2,...
+  CLASS_<NAME>_CLASS     = orchestrator | analyst | worker | fast
 
-The V-shape routing in llm.py maps depth → tier going down, and
-(max_depth - depth) → tier coming back up on merges. Leaf nodes and
-root node both resolve to tier 0 (same model quality, different token
-budgets). Middle of the tree uses lighter models.
+  Legacy PROVIDER_ROOT_* is imported as ORCHESTRATOR for backwards compat.
+  Legacy PROVIDER_TIER1_* → ANALYST, TIER2_* → WORKER, the rest → WORKER.
+  Any PROVIDER_<NAME>_* without a CLASS_ prefix → WORKER (safe default).
 
-If a tier has no provider configured it falls back to the next available
-tier (graceful degradation).
+At runtime, pool.for_class(ModelClass.ORCHESTRATOR) returns the best
+available provider for that class, falling back up the capability ladder
+if the preferred class is exhausted or unconfigured:
+  FAST → WORKER → ANALYST → ORCHESTRATOR (escalation on exhaustion)
 """
 import os
 import time
@@ -23,6 +23,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 from dotenv import load_dotenv
+
+from core.model_classes import ModelClass
 
 load_dotenv()
 
@@ -60,6 +62,7 @@ class Provider:
     base_url: str
     model: str
     api_keys: list[ApiKey]
+    model_class: ModelClass = ModelClass.WORKER
     extra_headers: dict[str, str] = field(default_factory=dict)
     errors: int = 0
 
@@ -93,13 +96,14 @@ class Provider:
 
 
 def _make_provider(name: str, base_url: str, model: str, raw_keys: str,
-                   extra_headers: dict) -> Provider:
+                   model_class: ModelClass, extra_headers: dict) -> Provider:
     keys = [
         ApiKey(value=v.strip(), provider_name=name)
         for v in raw_keys.split(",") if v.strip()
     ]
     return Provider(name=name, base_url=base_url, model=model,
-                    api_keys=keys, extra_headers=extra_headers)
+                    api_keys=keys, model_class=model_class,
+                    extra_headers=extra_headers)
 
 
 def _extra_headers(base_url: str) -> dict[str, str]:
@@ -108,112 +112,180 @@ def _extra_headers(base_url: str) -> dict[str, str]:
     return {}
 
 
+def _parse_class(raw: str) -> ModelClass:
+    mapping = {
+        "orchestrator": ModelClass.ORCHESTRATOR,
+        "analyst":      ModelClass.ANALYST,
+        "worker":       ModelClass.WORKER,
+        "fast":         ModelClass.FAST,
+    }
+    return mapping.get(raw.strip().lower(), ModelClass.WORKER)
+
+
+# Escalation order when preferred class is exhausted
+_ESCALATION: dict[ModelClass, list[ModelClass]] = {
+    ModelClass.FAST:         [ModelClass.FAST, ModelClass.WORKER, ModelClass.ANALYST, ModelClass.ORCHESTRATOR],
+    ModelClass.WORKER:       [ModelClass.WORKER, ModelClass.ANALYST, ModelClass.ORCHESTRATOR, ModelClass.FAST],
+    ModelClass.ANALYST:      [ModelClass.ANALYST, ModelClass.ORCHESTRATOR, ModelClass.WORKER, ModelClass.FAST],
+    ModelClass.ORCHESTRATOR: [ModelClass.ORCHESTRATOR, ModelClass.ANALYST, ModelClass.WORKER, ModelClass.FAST],
+}
+
+
 class ProviderPool:
     """
-    Manages providers organised into quality tiers (0 = strongest).
-
-    tiers: list[Provider]  — index 0 is strongest (ROOT), ascending = lighter
-    providers: list[Provider]  — alias for the lowest tier, used for pool rotation
-    root_provider: Provider  — tier 0 (backwards compat)
-    merge_provider: Provider  — tier 0 (final merge; same model, heavier budget in llm.py)
+    Manages providers organised by ModelClass.
+    Each class can have multiple providers (for key rotation).
     """
 
     def __init__(self):
-        self.tiers: list[Provider] = []   # ordered strongest → lightest
+        # class → list of providers, best first
+        self._by_class: dict[ModelClass, list[Provider]] = {mc: [] for mc in ModelClass}
         self._lock = asyncio.Lock()
         self._load_providers()
 
     def _load_providers(self):
-        reserved = {"ROOT", "MERGE"}
+        loaded: list[tuple[str, Provider]] = []
 
-        # ── Tier 0: ROOT ──────────────────────────────────────────────────────
+        # ── New-style CLASS_<NAME>_* ──────────────────────────────────────────
+        seen: set[str] = set()
+        for key in os.environ:
+            if key.startswith("CLASS_") and key.endswith("_BASE_URL"):
+                name = key[len("CLASS_"):-len("_BASE_URL")]
+                if name in seen:
+                    continue
+                seen.add(name)
+                url   = os.environ.get(f"CLASS_{name}_BASE_URL", "").strip()
+                model = os.environ.get(f"CLASS_{name}_MODEL", "gpt-3.5-turbo").strip()
+                raw   = os.environ.get(f"CLASS_{name}_KEYS", "").strip()
+                cls_s = os.environ.get(f"CLASS_{name}_CLASS", "worker").strip()
+                if url and raw:
+                    mc = _parse_class(cls_s)
+                    p  = _make_provider(name, url, model, raw, mc, _extra_headers(url))
+                    loaded.append((name, p))
+
+        # ── Legacy PROVIDER_ROOT_* → ORCHESTRATOR ────────────────────────────
         root_url  = os.environ.get("PROVIDER_ROOT_BASE_URL", "").strip()
         root_keys = os.environ.get("PROVIDER_ROOT_KEYS", "").strip()
         if root_url and root_keys:
             root_model = os.environ.get("PROVIDER_ROOT_MODEL", "gpt-4o").strip()
-            self.tiers.append(_make_provider("ROOT", root_url, root_model,
-                                             root_keys, _extra_headers(root_url)))
+            p = _make_provider("ROOT", root_url, root_model, root_keys,
+                               ModelClass.ORCHESTRATOR, _extra_headers(root_url))
+            loaded.append(("ROOT", p))
 
-        # ── Named tiers: TIER1, TIER2, … ─────────────────────────────────────
-        tier_idx = 1
-        while True:
-            name = f"TIER{tier_idx}"
-            url  = os.environ.get(f"PROVIDER_{name}_BASE_URL", "").strip()
-            keys = os.environ.get(f"PROVIDER_{name}_KEYS", "").strip()
-            if not url or not keys:
-                break
-            model = os.environ.get(f"PROVIDER_{name}_MODEL", "gpt-3.5-turbo").strip()
-            self.tiers.append(_make_provider(name, url, model, keys, _extra_headers(url)))
-            reserved.add(name)
-            tier_idx += 1
+        # ── Legacy PROVIDER_TIER1_* → ANALYST ────────────────────────────────
+        tier1_url  = os.environ.get("PROVIDER_TIER1_BASE_URL", "").strip()
+        tier1_keys = os.environ.get("PROVIDER_TIER1_KEYS", "").strip()
+        if tier1_url and tier1_keys:
+            tier1_model = os.environ.get("PROVIDER_TIER1_MODEL", "gpt-3.5-turbo").strip()
+            p = _make_provider("TIER1", tier1_url, tier1_model, tier1_keys,
+                               ModelClass.ANALYST, _extra_headers(tier1_url))
+            loaded.append(("TIER1", p))
 
-        # ── Remaining named providers → lowest tier ───────────────────────────
-        seen: set[str] = set()
+        # ── Legacy PROVIDER_TIER2_* → WORKER ─────────────────────────────────
+        tier2_url  = os.environ.get("PROVIDER_TIER2_BASE_URL", "").strip()
+        tier2_keys = os.environ.get("PROVIDER_TIER2_KEYS", "").strip()
+        if tier2_url and tier2_keys:
+            tier2_model = os.environ.get("PROVIDER_TIER2_MODEL", "gpt-3.5-turbo").strip()
+            p = _make_provider("TIER2", tier2_url, tier2_model, tier2_keys,
+                               ModelClass.WORKER, _extra_headers(tier2_url))
+            loaded.append(("TIER2", p))
+
+        # ── Legacy PROVIDER_<NAME>_* (everything else) → WORKER ──────────────
+        legacy_reserved = {"ROOT", "MERGE", "TIER1", "TIER2", "TIER3", "TIER4"}
+        legacy_seen: set[str] = set()
         for key in os.environ:
             if key.startswith("PROVIDER_") and key.endswith("_BASE_URL"):
                 name = key[len("PROVIDER_"):-len("_BASE_URL")]
-                if name in reserved or name in seen:
+                if name in legacy_reserved or name in legacy_seen:
                     continue
-                seen.add(name)
+                legacy_seen.add(name)
                 url   = os.environ.get(f"PROVIDER_{name}_BASE_URL", "").strip()
                 model = os.environ.get(f"PROVIDER_{name}_MODEL", "gpt-3.5-turbo").strip()
                 raw   = os.environ.get(f"PROVIDER_{name}_KEYS", "").strip()
                 if url and raw:
-                    self.tiers.append(_make_provider(name, url, model, raw,
-                                                     _extra_headers(url)))
+                    p = _make_provider(name, url, model, raw,
+                                       ModelClass.WORKER, _extra_headers(url))
+                    loaded.append((name, p))
 
-        if not self.tiers:
+        if not loaded:
             raise RuntimeError(
                 "No providers found in .env!\n"
-                "Copy .env.example to .env and fill in at least one provider."
+                "Add at least one CLASS_<NAME>_* or PROVIDER_* entry."
             )
 
-    # ── Backwards-compat properties ───────────────────────────────────────────
+        for _name, p in loaded:
+            self._by_class[p.model_class].append(p)
+
+    # ── Primary dispatch ──────────────────────────────────────────────────────
+
+    def for_class(self, mc: ModelClass) -> Provider:
+        """
+        Return an available provider for the given ModelClass.
+        Escalates through the capability ladder if the preferred class is
+        exhausted or unconfigured.
+        """
+        for candidate_class in _ESCALATION[mc]:
+            providers = self._by_class[candidate_class]
+            available = [p for p in providers if not p.all_exhausted()]
+            if available:
+                return min(available, key=lambda p: p.calls)
+        raise AllProvidersExhausted(
+            "All API keys are rate-limited. Please wait or add more keys."
+        )
+
+    def any_available(self) -> bool:
+        return any(
+            not p.all_exhausted()
+            for providers in self._by_class.values()
+            for p in providers
+        )
+
+    # ── Backwards-compat properties (used by widget_server, hm.py) ───────────
+
+    @property
+    def tiers(self) -> list[Provider]:
+        """Flat list: orchestrator first, fast last."""
+        out = []
+        for mc in [ModelClass.ORCHESTRATOR, ModelClass.ANALYST,
+                   ModelClass.WORKER, ModelClass.FAST]:
+            out.extend(self._by_class[mc])
+        return out
 
     @property
     def root_provider(self) -> Optional[Provider]:
-        return self.tiers[0] if self.tiers else None
+        providers = self._by_class[ModelClass.ORCHESTRATOR]
+        return providers[0] if providers else (self.tiers[0] if self.tiers else None)
 
     @property
     def merge_provider(self) -> Optional[Provider]:
-        return self.tiers[0] if self.tiers else None
+        return self.root_provider
 
     @property
     def providers(self) -> list[Provider]:
-        """Lowest tier providers — used for pool rotation fallback."""
+        """Lowest-class providers — backwards compat."""
+        for mc in [ModelClass.FAST, ModelClass.WORKER]:
+            ps = self._by_class[mc]
+            if ps:
+                return ps
         return self.tiers[-1:] if self.tiers else []
-
-    # ── Tier resolution ───────────────────────────────────────────────────────
-
-    def provider_for_tier(self, tier_idx: int) -> Provider:
-        """
-        Return the provider at tier_idx, clamped to available tiers.
-        Gracefully degrades: if tier_idx > len(tiers)-1, returns the lightest.
-        """
-        idx = min(tier_idx, len(self.tiers) - 1)
-        return self.tiers[idx]
 
     def num_tiers(self) -> int:
         return len(self.tiers)
 
-    # ── Pool rotation (within the lowest tier or all tiers as fallback) ───────
-
     def next_provider(self) -> Provider:
-        """Least-used available provider across all tiers (fallback path)."""
-        candidates = [p for p in self.tiers if not p.all_exhausted()]
-        if not candidates:
-            raise AllProvidersExhausted(
-                "All API keys are rate-limited. Please wait a moment or add more keys."
-            )
-        return min(candidates, key=lambda p: p.best_key().calls)  # type: ignore
+        return self.for_class(ModelClass.WORKER)
 
-    def any_available(self) -> bool:
-        return any(not p.all_exhausted() for p in self.tiers)
+    def provider_for_tier(self, tier_idx: int) -> Provider:
+        order = [ModelClass.ORCHESTRATOR, ModelClass.ANALYST,
+                 ModelClass.WORKER, ModelClass.FAST]
+        mc = order[min(tier_idx, len(order) - 1)]
+        return self.for_class(mc)
 
     def stats(self) -> list[dict]:
         return [
             {
                 "name": p.name, "model": p.model,
+                "class": p.model_class.value,
                 "calls": p.calls, "errors": p.errors,
                 "keys": len(p.api_keys), "key_status": p.key_status(),
             }
@@ -223,6 +295,7 @@ class ProviderPool:
 
 # Singleton
 _pool: Optional[ProviderPool] = None
+
 
 def get_pool() -> ProviderPool:
     global _pool

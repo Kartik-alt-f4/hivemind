@@ -150,6 +150,7 @@ async def _run_task(task: str, cwd: str | None = None, request_id: str | None = 
 
     # Reset global agent state between runs
     _node_module._agent_registry.clear()
+    _node_module._agent_count = 0
 
     pool = get_pool()
     req_id = request_id or _uuid.uuid4().hex
@@ -199,11 +200,8 @@ async def _run_task(task: str, cwd: str | None = None, request_id: str | None = 
     }
 
     output_dir = Path(cwd) if cwd else None
-    from agents.node import _is_project_task, _CONVERSATIONAL
-    # Conversational tasks get shallow depth — never need more than 1-2 agents
-    _max_depth = 5 if _is_project_task(task) else (1 if _CONVERSATIONAL.search(task) else 3)
     root = AgentNode(
-        task=task, depth=0, max_depth=_max_depth,
+        task=task, depth=0,
         output_dir=output_dir,
         sudo_callback=sudo_callback,
         on_shell_run=on_shell_run,
