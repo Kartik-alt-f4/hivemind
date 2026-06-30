@@ -18,6 +18,7 @@ if the preferred class is exhausted or unconfigured:
   FAST → WORKER → ANALYST → ORCHESTRATOR (escalation on exhaustion)
 """
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -64,6 +65,7 @@ class Provider:
     model_class: ModelClass = ModelClass.WORKER
     extra_headers: dict[str, str] = field(default_factory=dict)
     errors: int = 0
+    weight: int = 1   # dispatch weight — higher = more calls routed here
 
     @property
     def calls(self) -> int:
@@ -95,14 +97,15 @@ class Provider:
 
 
 def _make_provider(name: str, base_url: str, model: str, raw_keys: str,
-                   model_class: ModelClass, extra_headers: dict) -> Provider:
+                   model_class: ModelClass, extra_headers: dict,
+                   weight: int = 1) -> Provider:
     keys = [
         ApiKey(value=v.strip(), provider_name=name)
         for v in raw_keys.split(",") if v.strip()
     ]
     return Provider(name=name, base_url=base_url, model=model,
                     api_keys=keys, model_class=model_class,
-                    extra_headers=extra_headers)
+                    extra_headers=extra_headers, weight=weight)
 
 
 def _extra_headers(base_url: str) -> dict[str, str]:
@@ -157,8 +160,10 @@ class ProviderPool:
                 raw   = os.environ.get(f"CLASS_{name}_KEYS", "").strip()
                 cls_s = os.environ.get(f"CLASS_{name}_CLASS", "worker").strip()
                 if url and raw:
-                    mc = _parse_class(cls_s)
-                    p  = _make_provider(name, url, model, raw, mc, _extra_headers(url))
+                    mc  = _parse_class(cls_s)
+                    raw_w = os.environ.get(f"CLASS_{name}_WEIGHT", "1").strip()
+                    w   = int(raw_w) if raw_w.isdigit() else 1
+                    p   = _make_provider(name, url, model, raw, mc, _extra_headers(url), weight=w)
                     loaded.append((name, p))
 
         # ── Legacy PROVIDER_ROOT_* → ORCHESTRATOR ────────────────────────────
@@ -218,15 +223,31 @@ class ProviderPool:
 
     def for_class(self, mc: ModelClass) -> Provider:
         """
-        Return an available provider for the given ModelClass.
-        Escalates through the capability ladder if the preferred class is
-        exhausted or unconfigured.
+        Return an available provider for the given ModelClass using weighted
+        dispatch, then escalate through the capability ladder if exhausted.
+
+        Weighted dispatch: each provider's selection probability is proportional
+        to (weight / (calls + 1)) — weight biases toward high-limit providers,
+        call count naturally load-balances as usage accumulates.
+        Within the chosen provider, the least-used available key is picked.
         """
         for candidate_class in _ESCALATION[mc]:
-            providers = self._by_class[candidate_class]
-            available = [p for p in providers if not p.all_exhausted()]
-            if available:
-                return min(available, key=lambda p: p.calls)
+            available = [p for p in self._by_class[candidate_class]
+                         if not p.all_exhausted()]
+            if not available:
+                continue
+            if len(available) == 1:
+                return available[0]
+            # Weighted random: weight / (calls + 1) so busier providers cool off
+            scores = [p.weight / (p.calls + 1) for p in available]
+            total  = sum(scores)
+            pick   = random.random() * total
+            cumulative = 0.0
+            for p, score in zip(available, scores):
+                cumulative += score
+                if pick <= cumulative:
+                    return p
+            return available[-1]   # float rounding fallback
         raise AllProvidersExhausted(
             "All API keys are rate-limited. Please wait or add more keys."
         )
