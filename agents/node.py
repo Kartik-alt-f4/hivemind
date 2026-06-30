@@ -24,6 +24,7 @@ import asyncio
 import json
 import re
 import time
+import sys as _sys
 import uuid
 import pathlib
 import datetime
@@ -46,8 +47,7 @@ RAY_THRESHOLD = 4
 def _debug_log(msg: str):
     entry = f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}\n"
     pathlib.Path("hivemind_debug.log").open("a").write(entry)
-    import sys
-    print(f"\033[2m{entry.strip()}\033[0m", file=sys.stderr)
+    print(f"\033[2m{entry.strip()}\033[0m", file=_sys.stderr)
 
 
 class AgentStatus(Enum):
@@ -247,6 +247,15 @@ Subtask rules for "complex":
 """
 
 
+def _safe_model_class(value: str, default: ModelClass = ModelClass.WORKER) -> ModelClass:
+    """Parse a model class string, falling back to default on invalid input."""
+    try:
+        return ModelClass(value.strip().lower())
+    except (ValueError, AttributeError):
+        _debug_log(f"[model_class] unknown value {value!r}, defaulting to {default.value}")
+        return default
+
+
 async def _orchestrate(task: str) -> dict:
     """
     Call the ORCHESTRATOR model to classify and plan the task.
@@ -396,7 +405,7 @@ class AgentNode:
             self.status = AgentStatus.RUNNING
             self._emit()
             answer = await self._solve_direct(
-                model_class=ModelClass(plan.get("model_class", "worker")),
+                model_class=_safe_model_class(plan.get("model_class", "worker")),
             )
             answer = await self._execute_runs(answer)
             self.result = answer
@@ -421,17 +430,22 @@ class AgentNode:
             _debug_log(f"[{self.task_id}] budget trim {len(subtasks)}→{budget}")
             subtasks = subtasks[:budget]
 
-        # Initialise workspace for complex tasks
-        if self.output_dir or pathlib.Path.cwd():
-            self.workspace_path = _workspace_path(
-                self.root_task, self.output_dir or pathlib.Path.cwd()
-            )
-            _write_workspace(
-                self.workspace_path,
-                f"# HiveMind Workspace\n\n**Task:** {self.root_task}\n"
-                f"**Started:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-                f"**Subtasks:** {len(subtasks)}\n\n---\n"
-            )
+        # Mark as project if any subtask involves code/file generation
+        _CODE_TYPES = {"code", "implement", "generate", "architect"}
+        self.is_project = any(
+            st.get("task_type", "") in _CODE_TYPES for st in subtasks
+        )
+
+        # Initialise workspace
+        self.workspace_path = _workspace_path(
+            self.root_task, self.output_dir or pathlib.Path.cwd()
+        )
+        _write_workspace(
+            self.workspace_path,
+            f"# HiveMind Workspace\n\n**Task:** {self.root_task}\n"
+            f"**Started:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"**Subtasks:** {len(subtasks)}\n\n---\n"
+        )
 
         self.status = AgentStatus.RUNNING
         self.children = [
@@ -441,7 +455,7 @@ class AgentNode:
                 parent_id=self.task_id,
                 child_index=i,
                 root_task=self.root_task,
-                model_class=ModelClass(st.get("model_class", "worker")),
+                model_class=_safe_model_class(st.get("model_class", "worker")),
                 max_depth=self.max_depth,
                 on_update=self.on_update,
                 is_project=self.is_project,
@@ -522,13 +536,15 @@ class AgentNode:
             self._emit()
             self.result = await self._merge(model_class=ModelClass.ANALYST)
         else:
-            # Solve directly
-            answer = decision
-            if "##SOLVE##" in answer:
-                answer = answer.split("##SOLVE##", 1)[1].strip()
-            elif "##SPLIT##" in answer:
-                # Forced to solve despite split signal (budget exhausted)
+            # Solve directly — extract answer from whatever the model returned
+            if "##SOLVE##" in decision:
+                answer = decision.split("##SOLVE##", 1)[1].strip()
+            elif "##SPLIT##" in decision:
+                # Model wanted to split but budget is exhausted — re-ask to solve
                 answer = await self._solve_direct(model_class=self.model_class)
+            else:
+                # Model wrote its answer inline without a marker
+                answer = decision.strip()
             answer = await self._execute_runs(answer)
             if self.workspace_path:
                 _append_workspace(self.workspace_path, self.task_id, answer)
@@ -722,27 +738,24 @@ class AgentNode:
         return nodes
 
 
-# ── Backwards compat: _is_project_task and _CONVERSATIONAL still imported
-# by widget_server.py ─────────────────────────────────────────────────────────
+# ── Backwards compat: _is_project_task and _CONVERSATIONAL imported by widget_server.py ──
 
-import re as _re
-
-_CONVERSATIONAL = _re.compile(
+_CONVERSATIONAL = re.compile(
     r"\b(recipe|cook|food|eat|drink|meal|ingredient|marinade|how do|"
     r"what is|what are|explain|tell me|give me|can i|should i|why|"
     r"help me understand|difference between|compare|recommend|suggest|"
     r"idea|opinion|advice|tips?|trick|hack|joke|story|poem|haiku|"
     r"translate|summarize|summarise|list|pros|cons|guide|tutorial|"
     r"newbie|beginner|intro|overview|basics|cheat.?sheet)\b",
-    _re.IGNORECASE,
+    re.IGNORECASE,
 )
 
-_PROJECT_HINTS = _re.compile(
+_PROJECT_HINTS = re.compile(
     r"\b(build|implement|develop|refactor|migrate|setup|scaffold|"
     r"write|create|make|generate|"
     r"code|program|script|module|function|class|api|cli|server|app|"
     r"website|webpage|frontend|backend|database|pipeline)\b",
-    _re.IGNORECASE,
+    re.IGNORECASE,
 )
 
 

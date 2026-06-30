@@ -150,7 +150,6 @@ async def _run_task(task: str, cwd: str | None = None, request_id: str | None = 
 
     # Reset global agent state between runs
     _node_module._agent_registry.clear()
-    _node_module._agent_count = 0
 
     pool = get_pool()
     req_id = request_id or _uuid.uuid4().hex
