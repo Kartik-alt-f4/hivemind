@@ -107,48 +107,94 @@ _LANG_EXT = {
 }
 
 
+_ALLOWED_EXTS = {
+    "py", "js", "ts", "html", "css", "json", "yml", "yaml",
+    "sh", "md", "txt", "rs", "go", "c", "cpp", "toml",
+}
+
+# Matches explicit paths in task text: ~/some/path/file.ext or /abs/path/file.ext
+_TASK_PATH_RE = re.compile(r"(?:^|\s)(~[^\s]*\.[a-zA-Z0-9]+|/[^\s]*\.[a-zA-Z0-9]+)")
+
+
+def _resolve_fname(fname: str, output_dir: pathlib.Path) -> pathlib.Path | None:
+    """Resolve a filename or path to an absolute Path, or None if invalid."""
+    fname = fname.strip().lstrip("#").strip()
+    # Reject if no extension or has spaces (unless it's a path)
+    if "." not in fname:
+        return None
+    ext = fname.split(".")[-1].lower()
+    if ext not in _ALLOWED_EXTS:
+        return None
+    p = pathlib.Path(fname).expanduser()
+    if p.is_absolute():
+        return p
+    # Relative — resolve against output_dir
+    # But reject bare names with spaces (likely not filenames)
+    if " " in fname and not fname.startswith("/") and not fname.startswith("~"):
+        return None
+    return output_dir / fname
+
+
 def _extract_and_write_files(result: str, output_dir: pathlib.Path,
-                              root_task: str) -> list[pathlib.Path]:
+                              root_task: str,
+                              explicit_path: pathlib.Path | None = None) -> list[pathlib.Path]:
     written: list[pathlib.Path] = []
-    seen_names: set[str] = set()
+    seen: set[pathlib.Path] = set()
 
     def _write(fname: str, code: str):
-        fname = fname.strip().lstrip("#").strip()
-        if "." not in fname or " " in fname:
+        path = _resolve_fname(fname, output_dir)
+        if path is None or path in seen:
             return
-        if fname.split(".")[-1] not in _LANG_EXT.values() and \
-           fname.split(".")[-1] not in {
-               "py", "js", "ts", "html", "css", "json", "yml",
-               "yaml", "sh", "md", "txt", "rs", "go", "c", "cpp", "toml"
-           }:
-            return
-        if fname in seen_names:
-            return
-        seen_names.add(fname)
-        path = output_dir / fname
+        seen.add(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(code)
         written.append(path)
 
+    def _write_to(path: pathlib.Path, code: str):
+        if path in seen:
+            return
+        seen.add(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(code)
+        written.append(path)
+
+    # Pattern 1: fenced blocks with filename on the opening line
     for m in _FENCED_FILE.finditer(result):
         _write(m.group(1), m.group(2))
 
+    # Pattern 2: heading then fenced block
     if not written:
         for m in _HEADING_FENCED.finditer(result):
             _write(m.group(1), m.group(2))
 
+    # Pattern 3: any fenced block by language — use explicit path if known,
+    # else fall back to slug-based name
     if not written:
         slug = re.sub(r"[^a-z0-9]+", "_", root_task.lower())[:32].strip("_")
         for lang, code in _FENCED_LANG.findall(result):
             ext = _LANG_EXT.get(lang.lower())
             if not ext:
-                continue
-            fname = f"{slug}.{ext}"
-            base, n = slug, 1
-            while fname in seen_names:
-                fname = f"{base}_{n}.{ext}"
-                n += 1
-            _write(fname, code)
+                # For markdown, lang might be "markdown" or "md" — treat as .md
+                if lang.lower() in ("markdown", "md"):
+                    ext = "md"
+                else:
+                    continue
+            if explicit_path and explicit_path.suffix.lstrip(".") == ext:
+                _write_to(explicit_path, code)
+            else:
+                fname = f"{slug}.{ext}"
+                base, n = slug, 1
+                while (output_dir / fname) in seen:
+                    fname = f"{base}_{n}.{ext}"
+                    n += 1
+                _write(fname, code)
+
+    # Pattern 4: if explicit path requested but nothing matched fences,
+    # write the entire result text (for prose/markdown tasks)
+    if not written and explicit_path:
+        ext = explicit_path.suffix.lstrip(".").lower()
+        if ext in _ALLOWED_EXTS:
+            _write_to(explicit_path, result)
 
     return written
 
@@ -365,8 +411,11 @@ class AgentNode:
         if self.depth == 0 and self.result and not self.result.startswith("[ERROR]"):
             if not self.files_written:
                 out = self.output_dir or pathlib.Path.cwd()
+                # Detect explicit output path from the task text
+                _pm = _TASK_PATH_RE.search(self.root_task)
+                _explicit = pathlib.Path(_pm.group(1).strip()).expanduser() if _pm else None
                 self.files_written = _extract_and_write_files(
-                    self.result, out, self.root_task
+                    self.result, out, self.root_task, explicit_path=_explicit
                 )
             for f in self.files_written:
                 _debug_log(f"[{self.task_id}] FILE WRITTEN: {f}")
@@ -417,11 +466,15 @@ class AgentNode:
             _debug_log(f"[{self.task_id}] budget trim {len(subtasks)}→{budget}")
             subtasks = subtasks[:budget]
 
-        # Mark as project if any subtask involves code/file generation
-        _CODE_TYPES = {"code", "implement", "generate", "architect"}
+        # Mark as project if any subtask produces files
+        _FILE_TYPES = {"code", "implement", "generate", "architect",
+                       "write", "document", "research", "extract", "summarize_short"}
         self.is_project = any(
-            st.get("task_type", "") in _CODE_TYPES for st in subtasks
+            st.get("task_type", "") in _FILE_TYPES for st in subtasks
         )
+        # Also mark as project if the root task mentions an explicit output path
+        if not self.is_project:
+            self.is_project = bool(_TASK_PATH_RE.search(self.root_task))
 
         # Initialise workspace
         self.workspace_path = _workspace_path(
@@ -547,11 +600,28 @@ class AgentNode:
             if existing:
                 ws_context = f"\n\nWorkspace context:\n{existing[-1500:]}"
 
-        file_hint = (
-            "\n\nWhen your answer includes code, wrap each file in a fenced block "
-            "with its filename on the opening line, e.g.:\n"
-            "```python snake.py\n<code>\n```"
-        ) if self.is_project else ""
+        # Build file hint: detect explicit path from task text
+        _explicit = None
+        _path_m = _TASK_PATH_RE.search(self.task)
+        if _path_m:
+            _explicit = pathlib.Path(_path_m.group(1).strip()).expanduser()
+        if self.is_project:
+            if _explicit:
+                file_hint = (
+                    f"\n\nWrite your complete output as a single fenced block. "
+                    f"Put the filename `{_explicit.name}` on the opening line, e.g.:\n"
+                    f"```markdown {_explicit.name}\n<content>\n```\n"
+                    f"Do not add commentary outside the fenced block."
+                )
+            else:
+                file_hint = (
+                    "\n\nWhen your answer includes file content, wrap each file in a "
+                    "fenced block with its filename on the opening line, e.g.:\n"
+                    "```python snake.py\n<code>\n```\n"
+                    "```markdown guide.md\n<content>\n```"
+                )
+        else:
+            file_hint = ""
 
         system = (
             "You are a HiveMind agent. Solve the task completely and directly. "
