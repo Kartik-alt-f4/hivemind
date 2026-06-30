@@ -98,11 +98,20 @@ class Provider:
 
 def _make_provider(name: str, base_url: str, model: str, raw_keys: str,
                    model_class: ModelClass, extra_headers: dict,
-                   weight: int = 1) -> Provider:
-    keys = [
-        ApiKey(value=v.strip(), provider_name=name)
-        for v in raw_keys.split(",") if v.strip()
-    ]
+                   weight: int = 1,
+                   key_registry: dict | None = None) -> Provider:
+    keys = []
+    for v in raw_keys.split(","):
+        v = v.strip()
+        if not v:
+            continue
+        if key_registry is not None and v in key_registry:
+            keys.append(key_registry[v])   # reuse shared object
+        else:
+            ak = ApiKey(value=v, provider_name=name)
+            if key_registry is not None:
+                key_registry[v] = ak
+            keys.append(ak)
     return Provider(name=name, base_url=base_url, model=model,
                     api_keys=keys, model_class=model_class,
                     extra_headers=extra_headers, weight=weight)
@@ -140,8 +149,10 @@ class ProviderPool:
     """
 
     def __init__(self):
-        # class → list of providers, best first
         self._by_class: dict[ModelClass, list[Provider]] = {mc: [] for mc in ModelClass}
+        # Shared ApiKey objects keyed by raw value — same physical key across
+        # multiple provider entries shares one call counter and rate-limit flag.
+        self._key_registry: dict[str, ApiKey] = {}
         self._load_providers()
 
     def _load_providers(self):
@@ -163,7 +174,8 @@ class ProviderPool:
                     mc  = _parse_class(cls_s)
                     raw_w = os.environ.get(f"CLASS_{name}_WEIGHT", "1").strip()
                     w   = int(raw_w) if raw_w.isdigit() else 1
-                    p   = _make_provider(name, url, model, raw, mc, _extra_headers(url), weight=w)
+                    p   = _make_provider(name, url, model, raw, mc, _extra_headers(url),
+                                         weight=w, key_registry=self._key_registry)
                     loaded.append((name, p))
 
         # ── Legacy PROVIDER_ROOT_* → ORCHESTRATOR ────────────────────────────
@@ -172,7 +184,8 @@ class ProviderPool:
         if root_url and root_keys:
             root_model = os.environ.get("PROVIDER_ROOT_MODEL", "gpt-4o").strip()
             p = _make_provider("ROOT", root_url, root_model, root_keys,
-                               ModelClass.ORCHESTRATOR, _extra_headers(root_url))
+                               ModelClass.ORCHESTRATOR, _extra_headers(root_url),
+                               key_registry=self._key_registry)
             loaded.append(("ROOT", p))
 
         # ── Legacy PROVIDER_TIER1_* → ANALYST ────────────────────────────────
@@ -181,7 +194,8 @@ class ProviderPool:
         if tier1_url and tier1_keys:
             tier1_model = os.environ.get("PROVIDER_TIER1_MODEL", "gpt-3.5-turbo").strip()
             p = _make_provider("TIER1", tier1_url, tier1_model, tier1_keys,
-                               ModelClass.ANALYST, _extra_headers(tier1_url))
+                               ModelClass.ANALYST, _extra_headers(tier1_url),
+                               key_registry=self._key_registry)
             loaded.append(("TIER1", p))
 
         # ── Legacy PROVIDER_TIER2_* → WORKER ─────────────────────────────────
@@ -190,7 +204,8 @@ class ProviderPool:
         if tier2_url and tier2_keys:
             tier2_model = os.environ.get("PROVIDER_TIER2_MODEL", "gpt-3.5-turbo").strip()
             p = _make_provider("TIER2", tier2_url, tier2_model, tier2_keys,
-                               ModelClass.WORKER, _extra_headers(tier2_url))
+                               ModelClass.WORKER, _extra_headers(tier2_url),
+                               key_registry=self._key_registry)
             loaded.append(("TIER2", p))
 
         # ── Legacy PROVIDER_<NAME>_* (everything else) → WORKER ──────────────
@@ -207,7 +222,8 @@ class ProviderPool:
                 raw   = os.environ.get(f"PROVIDER_{name}_KEYS", "").strip()
                 if url and raw:
                     p = _make_provider(name, url, model, raw,
-                                       ModelClass.WORKER, _extra_headers(url))
+                                       ModelClass.WORKER, _extra_headers(url),
+                                       key_registry=self._key_registry)
                     loaded.append((name, p))
 
         if not loaded:
