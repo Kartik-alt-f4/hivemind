@@ -234,7 +234,7 @@ def _print_stats(agents: int, per_key: dict, tokens: int, key_health: dict):
 
 # ── Core streaming task ───────────────────────────────────────────────────────
 
-def run_task(task: str, history: list[dict]) -> str | None:
+def run_task(task: str, history: list[dict], output_dir: str | None = None) -> str | None:
     """
     Stream a task to the server. Returns the result text, or None on error.
     Shows a live growing tree of agents while work is in progress.
@@ -243,7 +243,8 @@ def run_task(task: str, history: list[dict]) -> str | None:
     from rich.markup import escape
 
     req_id = uuid.uuid4().hex
-    payload = {"task": task, "cwd": os.getcwd(), "request_id": req_id}
+    cwd = output_dir if output_dir else os.getcwd()
+    payload = {"task": task, "cwd": cwd, "request_id": req_id}
 
     result_text:   list[str]  = []
     error_text:    list[str]  = []
@@ -475,6 +476,8 @@ def main():
     parser.add_argument("--status", action="store_true", help="Show server health")
     parser.add_argument("--no-server", action="store_true",
                         help="Don't auto-launch server if not running")
+    parser.add_argument("--output-dir", metavar="DIR",
+                        help="Directory to write output files into (created if needed)")
     args = parser.parse_args()
 
     if args.status:
@@ -489,7 +492,12 @@ def main():
     if args.task:
         task = " ".join(args.task)
         history = _load_history()
-        result = run_task(task, history)
+        out_dir = None
+        if args.output_dir:
+            import pathlib
+            out_dir = str(pathlib.Path(args.output_dir).expanduser().resolve())
+            pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
+        result = run_task(task, history, output_dir=out_dir)
         if result:
             history.append({"role": "user",      "text": task,   "ts": time.time()})
             history.append({"role": "assistant",  "text": result, "ts": time.time()})

@@ -190,9 +190,9 @@ def _extract_and_write_files(result: str, output_dir: pathlib.Path,
     # Pattern 3: any fenced block by language
     if not written:
         slug = re.sub(r"[^a-z0-9]+", "_", root_task.lower())[:32].strip("_")
-        for lang_tag, code in _FENCED_LANG.findall(result):
+        for lang_tag, code in _extract_fenced_blocks(result):
             # lang_tag may be "python" or "python chess.py" — extract just the language word
-            lang = lang_tag.split()[0].lower()
+            lang = lang_tag.split()[0].lower() if lang_tag else ""
             ext = _LANG_EXT.get(lang)
             if not ext:
                 continue
@@ -287,20 +287,32 @@ For "ambiguous":
 For "complex":
   {
     "route": "complex",
+    "task_type": "<generate|debug>",
     "output_shape": "<single_file|multi_file|document|analysis>",
     "file_owners": [
       {
         "domain": "short_label",
         "task": "What this domain covers.",
+        "depends_on": [],
         "workers": [
           {"task": "def fn_name(params) -> type: one sentence. Calls: [other_fn if needed].", "model_class": "worker"}
         ]
       }
     ],
-    "interfaces": "KEEP UNDER 200 CHARS. Key shared types only, no newlines. E.g.: 'board:list[list[str|None]] 8x8 board[rank][file] rank0=top, piece=2char type+color e.g.k+/p- piece[0]=type piece[1]=color'. Omit for prose."
+    "interfaces": "KEEP UNDER 200 CHARS. No newlines. MUST specify: piece encoding, color values, coordinate types, board orientation. E.g.: 'board[rank][file] rank0=black_back rank7=white_back | piece:2ch piece[0]=type(rnbqkp) piece[1]=color | color:+/- ONLY | file:int 0-7 rank:int 0-7'. Omit for prose."
   }
   IMPORTANT: output_shape and file_owners MUST appear before interfaces in the JSON.
   The interfaces field is lowest priority — complete the plan first, add interfaces last.
+
+task_type rules:
+  "generate" — create new code from scratch (default)
+  "debug"    — a file is provided and the task asks to fix, debug, or correct it.
+               Detect: prompt contains a file path, or uses words like fix/debug/broken/crash/error.
+               In debug mode: each worker fixes ONE specific bug in the provided file.
+               Worker task field must include: the exact function name to fix, the bug description,
+               and the correct signature. Workers output only the corrected function body.
+               CRITICAL for debug: each function name must appear in AT MOST ONE worker across
+               ALL file_owners. Never assign two workers to fix the same function.
 
 output_shape guide:
   single_file  — all output assembles into one file (e.g. a chess game, a web page)
@@ -315,11 +327,21 @@ Rules for "complex" code tasks:
   • Prefer MORE workers with SMALLER scope over fewer workers with larger scope.
     A worker that writes ~10-30 lines is far more reliable than one writing 80+ lines.
     Split generously: one function per worker, always.
-  • Function names must be unique across ALL workers in the entire plan — no duplicates.
+  • Function names must be unique across ALL workers in the ENTIRE plan — no duplicates AT ALL.
+    Before finalising the plan, scan every worker task and verify no function name appears twice.
+    If two domains need the same operation, one calls the other's function by name.
   • All workers must use the exact types from the interfaces contract.
-  • Tell workers what functions from other workers they may call, e.g.:
-    "Call get_piece_moves(board, file, rank, en_passant) — do NOT reimplement it."
-  • One worker per file_owner must implement the entry point (main/run/game_loop) that calls the others by their exact function names.
+  • Tell workers what functions from other workers they may call, INCLUDING the full signature and return semantics:
+    "Call get_piece_moves(board: list, file: int, rank: int) -> list[tuple]: returns list of valid moves."
+    "Call add_task(tasks: list[dict], description: str) -> None: mutates tasks in-place, returns nothing — call as statement."
+    NEVER write just a bare function name — always include the full def signature and state whether it returns a value or mutates in-place.
+  • One worker per file_owner must implement the entry point. Name it EXACTLY `main()` — always, for every project. The auto-assembler looks for `main()` to add the `if __name__ == '__main__'` block. Never name it run_game, start_app, or anything else.
+  • Any function that dispatches on 4+ cases (e.g. piece type switch) MUST be split:
+    one worker per case, plus one thin dispatcher worker that calls them by name.
+    NEVER assign a 6-case switch to a single worker — it will produce incomplete output.
+  • Each file_owner must list domain names it depends on in `depends_on` (empty list if independent).
+    If domain B needs types/functions from domain A, B must list A in depends_on.
+    Order workers so dependencies come first (independent domains first).
   • file_owners run in parallel; workers within each file_owner run in parallel.
   • For single_file output: the assembly agent stitches all worker functions into one file.
 
@@ -417,7 +439,7 @@ def _parse_orchestrate_raw(raw: str) -> dict | None:
         for m in re.finditer(r'\{\s*"domain"\s*:\s*"([^"]+)".*?"workers"\s*:\s*(\[(?:[^\[\]]|\[[^\[\]]*\])*\])', fragment, re.DOTALL):
             try:
                 workers_raw = json.loads(m.group(2))
-                owners.append({"domain": m.group(1), "task": m.group(1), "workers": workers_raw})
+                owners.append({"domain": m.group(1), "task": m.group(1), "depends_on": [], "workers": workers_raw})
             except json.JSONDecodeError:
                 pass
         # Extract route/shape/interfaces via regex
@@ -464,6 +486,22 @@ async def _orchestrate(task: str) -> dict:
     if "interfaces" in result and len(result["interfaces"]) > 400:
         result["interfaces"] = result["interfaces"][:400]
         _debug_log("[orchestrate] interfaces field trimmed to 400 chars")
+
+    # Debug mode: enforce one worker per function — drop duplicates across all file_owners
+    if result.get("task_type") == "debug" and result.get("file_owners"):
+        seen_fns: set[str] = set()
+        for fo in result["file_owners"]:
+            deduped = []
+            for w in fo.get("workers", []):
+                fn_m = re.search(r'def (\w+)\s*\(', w.get("task", ""))
+                fn_name = fn_m.group(1) if fn_m else None
+                if fn_name and fn_name in seen_fns:
+                    _debug_log(f"[orchestrate] debug dedup: dropping duplicate worker for {fn_name}")
+                    continue
+                if fn_name:
+                    seen_fns.add(fn_name)
+                deduped.append(w)
+            fo["workers"] = deduped
 
     _debug_log(
         f"[orchestrate] → {result.get('route')} | "
@@ -571,6 +609,135 @@ def _merge_system(shape: OutputShape, is_file_owner: bool = False) -> tuple[str,
     return prompt, tokens
 
 
+# ── Manifest helpers (one file per worker, no lock needed) ───────────────────
+
+def _manifest_path(workspace_path: pathlib.Path, task_id: str) -> pathlib.Path:
+    """Each worker owns exactly one manifest file — no shared-write contention."""
+    return workspace_path.parent / "bin" / f"manifest.{task_id}.json"
+
+
+def _manifest_read(workspace_path: pathlib.Path) -> dict:
+    """Merge all per-worker manifest files in the bin dir into one dict."""
+    bin_dir = workspace_path.parent / "bin"
+    result: dict = {}
+    try:
+        for f in bin_dir.glob("manifest.*.json"):
+            try:
+                result.update(json.loads(f.read_text()))
+            except (json.JSONDecodeError, OSError):
+                pass
+    except OSError:
+        pass
+    return result
+
+
+def _manifest_write_entry(
+    workspace_path: pathlib.Path,
+    task_id: str,
+    fn_name: str,
+    signature: str,
+    domain: str,
+) -> None:
+    """Write this worker's manifest entry to its own file. Atomic, no contention."""
+    if not fn_name or not signature:
+        return
+    entry = {task_id: {"fn_name": fn_name, "signature": signature,
+                        "domain": domain, "written_at": time.time()}}
+    path = _manifest_path(workspace_path, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(entry))
+
+
+def _extract_signature(code: str) -> str:
+    """Extract the first top-level def line (including return annotation)."""
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("def "):
+            return stripped.rstrip(":").strip()
+    return ""
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _dedup_top_level_fns(source: str) -> str:
+    """Remove earlier duplicate top-level function definitions, keeping the last one."""
+    # Split into chunks: each chunk starts at a column-0 `def ` line
+    chunks: list[str] = []
+    current: list[str] = []
+    for line in source.splitlines(keepends=True):
+        if line.startswith("def ") and current:
+            chunks.append("".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        chunks.append("".join(current))
+
+    # Walk chunks, track function names; on duplicate, drop the earlier chunk
+    seen: dict[str, int] = {}   # fn_name → index in chunks list
+    for i, chunk in enumerate(chunks):
+        m = re.match(r'def (\w+)\s*\(', chunk)
+        if m:
+            name = m.group(1)
+            if name in seen:
+                chunks[seen[name]] = ""  # erase earlier definition
+                _debug_log(f"[dedup] removed duplicate def {name}")
+            seen[name] = i
+
+    return "".join(c for c in chunks if c)
+
+
+def _extract_fenced_blocks(text: str) -> list[tuple[str, str]]:
+    """
+    Extract all fenced code blocks from text as (lang_tag, body) pairs.
+    Uses a line scanner so that backticks inside string literals don't
+    prematurely close the fence — only a line whose *entire* content is
+    three or more backticks counts as a closing fence.
+    """
+    blocks: list[tuple[str, str]] = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Opening fence: line starts with ``` followed by optional lang tag
+        if line.startswith("```") and len(line) >= 3:
+            fence_char_count = len(line) - len(line.lstrip("`"))
+            lang_tag = line[fence_char_count:].strip()
+            body_lines: list[str] = []
+            i += 1
+            while i < len(lines):
+                inner = lines[i]
+                # Closing fence: line is only backtick(s), same count or more
+                stripped = inner.strip()
+                if stripped and all(c == "`" for c in stripped) and len(stripped) >= fence_char_count:
+                    break
+                body_lines.append(inner)
+                i += 1
+            blocks.append((lang_tag, "\n".join(body_lines)))
+        i += 1
+    return blocks
+
+
+def _extract_code_for_bin(text: str) -> str:
+    """Extract the largest fenced python code block, falling back to raw text."""
+    blocks = _extract_fenced_blocks(text)
+    best = ""
+    # Prefer python-tagged blocks
+    for lang_tag, body in blocks:
+        lang = lang_tag.split()[0].lower() if lang_tag else ""
+        if lang in ("python", "py") and len(body) > len(best):
+            best = body
+    if best:
+        return best.strip()
+    # Fall back to any fenced block
+    for lang_tag, body in blocks:
+        if len(body) > len(best):
+            best = body
+    if best:
+        return best.strip()
+    return text.strip()
+
+
 # ── Agent Node ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -610,6 +777,11 @@ class AgentNode:
     # Not propagated further — consumed in _file_owner_run.
     _worker_specs: list[dict] = field(default_factory=list)
     _interfaces: str = ""
+    _depends_on: list[str] = field(default_factory=list)
+    _task_type: str = "generate"   # "generate" | "debug"
+    _source_file: str = ""         # full source content for debug tasks
+    _contract: dict = field(default_factory=dict)  # structured worker contract from _brief_workers
+    _sibling_sigs: dict = field(default_factory=dict)  # {fn_name: signature} from all sibling domains
 
     def __post_init__(self):
         _agent_registry[self.agent_id] = self
@@ -653,8 +825,11 @@ class AgentNode:
         finally:
             self.ended_at = time.time()
 
-        # Write output files at root
-        if self.role == AgentRole.ORCHESTRATOR and self.result and not self.result.startswith("[ERROR]"):
+        # Write output files at root — only for project tasks, not Q&A/prose
+        if (self.role == AgentRole.ORCHESTRATOR
+                and self.is_project
+                and self.result
+                and not self.result.startswith("[ERROR]")):
             if not self.files_written:
                 out = self.output_dir or pathlib.Path.cwd()
                 _pm = _TASK_PATH_RE.search(self.root_task)
@@ -704,6 +879,19 @@ class AgentNode:
 
         self.output_shape = _safe_output_shape(plan.get("output_shape", "document"))
         self._interfaces = plan.get("interfaces", "") or ""
+        self._task_type = plan.get("task_type", "generate")
+
+        # For debug tasks: load source file from path mentioned in the task
+        if self._task_type == "debug":
+            _pm = _TASK_PATH_RE.search(self.root_task)
+            if _pm:
+                _src_path = pathlib.Path(_pm.group(1).strip()).expanduser()
+                try:
+                    self._source_file = _src_path.read_text()
+                    _debug_log(f"[{self.task_id}] debug mode: loaded source {_src_path} ({len(self._source_file)} bytes)")
+                except Exception as e:
+                    _debug_log(f"[{self.task_id}] debug mode: could not load source: {e}")
+
         self.is_project = self.output_shape in (OutputShape.SINGLE_FILE, OutputShape.MULTI_FILE)
         if not self.is_project:
             self.is_project = bool(_TASK_PATH_RE.search(self.root_task))
@@ -725,6 +913,24 @@ class AgentNode:
             file_owners = file_owners[:budget]
 
         self.status = AgentStatus.RUNNING
+
+        # Build a cross-domain signature map: {fn_name: full_def_line}
+        # extracted from every worker task string across all file_owners.
+        # Each file_owner gets the signatures of ALL other domains' functions
+        # so the contract compiler can fill in callee signatures accurately.
+        _all_sigs: dict[str, str] = {}
+        for fo in file_owners:
+            for ws in fo.get("workers", []):
+                _sig_m = re.search(
+                    r'(def \w+\s*\([^)]*\)\s*(?:->\s*[^\n:]+)?)',
+                    ws.get("task", "")
+                )
+                if _sig_m:
+                    _sig = _sig_m.group(1).strip()
+                    _fn_m = re.search(r'def (\w+)\s*\(', _sig)
+                    if _fn_m:
+                        _all_sigs[_fn_m.group(1)] = _sig
+
         self.children = [
             AgentNode(
                 task=fo["task"],
@@ -747,6 +953,10 @@ class AgentNode:
                 # carry worker specs so file_owner can spawn them
                 _worker_specs=fo.get("workers", []),
                 _interfaces=self._interfaces,
+                _depends_on=fo.get("depends_on", []),
+                _task_type=self._task_type,
+                _source_file=self._source_file,
+                _sibling_sigs=_all_sigs,
             )
             for i, fo in enumerate(file_owners)
         ]
@@ -759,13 +969,55 @@ class AgentNode:
         # File owners run in parallel
         await asyncio.gather(*[child.run(semaphore) for child in self.children])
 
-        # Root final audit — upward-heavy: ORCHESTRATOR
+        # Root final assembly — dependency-aware pure concatenation (no LLM merge)
         self.status = AgentStatus.MERGING
         self._emit()
-        self.result = await self._merge(
-            model_class=ModelClass.ORCHESTRATOR,
-            is_file_owner=False,
-        )
+
+        def _topo_sort(owners):
+            result = []
+            remaining = list(owners)
+            resolved = set()
+            max_iter = len(owners) * len(owners) + 1
+            i = 0
+            while remaining and i < max_iter:
+                i += 1
+                for owner in list(remaining):
+                    if all(dep in resolved for dep in getattr(owner, "_depends_on", [])):
+                        result.append(owner)
+                        resolved.add(owner.domain)
+                        remaining.remove(owner)
+            result.extend(remaining)  # unresolvable deps go last
+            return result
+
+        ordered = _topo_sort(self.children)
+        sections = []
+        for owner in ordered:
+            if owner.result and owner.result.strip():
+                sections.append(f"# ══ {owner.domain} ══\n{owner.result.strip()}")
+
+        if self._task_type == "debug" and self._source_file:
+            # Debug mode: splice fixed functions back into the source file
+            final_code = self._splice_debug_fixes(sections)
+        else:
+            final_code = "\n\n".join(sections)
+
+        # Auto-append entrypoint if a main fn exists but __name__ guard is missing
+        if (self._task_type != "debug"
+                and "if __name__" not in final_code):
+            _main_m = re.search(r'^def (main(?:_\w+)?|run_game|run_app|game_loop|start_game|start_app)\s*\(', final_code, re.MULTILINE)
+            if _main_m:
+                final_code = final_code.rstrip() + f"\n\nif __name__ == '__main__':\n    {_main_m.group(1)}()\n"
+                _debug_log(f"[{self.task_id}] auto-appended __main__ entrypoint for {_main_m.group(1)}")
+
+        self.result = final_code
+
+        # Write assembled code directly to output_dir (no fenced wrapper in v3)
+        if self.output_dir and final_code.strip():
+            slug = re.sub(r"[^a-z0-9]+", "_", self.root_task.lower())[:48].strip("_")
+            out_path = pathlib.Path(self.output_dir) / f"{slug}.py"
+            out_path.write_text(final_code)
+            _debug_log(f"[{self.task_id}] wrote final output: {out_path} ({len(final_code)} bytes)")
+
         self.status = AgentStatus.DONE
         self._emit()
 
@@ -793,15 +1045,38 @@ class AgentNode:
             _debug_log(f"[{self.task_id}] budget trim workers {len(worker_specs)}→{budget}")
             worker_specs = worker_specs[:budget]
 
-        self.children = [
-            AgentNode(
+        # Compile structured contracts for each worker
+        worker_specs = await self._brief_workers(worker_specs, semaphore)
+
+        # Build index: fn_name → worker_spec index within this domain
+        domain_fns: dict[str, int] = {}
+        for i, ws in enumerate(worker_specs):
+            fn = ws.get("contract", {}).get("fn_name", "")
+            if fn:
+                domain_fns[fn] = i
+
+        # Partition into phase1 (no intra-domain deps) and phase2 (waits for siblings)
+        phase1_specs: list[tuple[int, dict]] = []
+        phase2_specs: list[tuple[int, dict]] = []
+        for i, ws in enumerate(worker_specs):
+            calls = ws.get("contract", {}).get("calls", {})
+            if any(callee in domain_fns for callee in calls):
+                phase2_specs.append((i, ws))
+            else:
+                phase1_specs.append((i, ws))
+
+        _debug_log(
+            f"[{self.task_id}] ({self.domain}) phase1={len(phase1_specs)} phase2={len(phase2_specs)}"
+        )
+
+        def _make_worker_node(ws: dict, child_index: int) -> "AgentNode":
+            return AgentNode(
                 task=ws["task"],
                 depth=self.depth + 1,
                 parent_id=self.task_id,
-                child_index=i,
+                child_index=child_index,
                 root_task=self.root_task,
                 role=AgentRole.WORKER,
-                # workers use WORKER class (downward-light)
                 model_class=_safe_model_class(ws.get("model_class", "worker")),
                 output_shape=self.output_shape,
                 domain=self.domain,
@@ -813,35 +1088,89 @@ class AgentNode:
                 sudo_callback=self.sudo_callback,
                 on_shell_run=self.on_shell_run,
                 _interfaces=self._interfaces,
+                _task_type=self._task_type,
+                _source_file=self._source_file,
+                _contract=ws.get("contract", {}),
+                _sibling_sigs=self._sibling_sigs,
             )
-            for i, ws in enumerate(worker_specs)
-        ]
+
+        # ── Phase 1: fire independent workers immediately ──────────────────────
+        phase1_children = [_make_worker_node(ws, i) for i, ws in phase1_specs]
+        self.children = list(phase1_children)
         self._emit()
         _debug_log(
-            f"[{self.task_id}] ({self.domain}) spawning {len(self.children)} workers: "
-            + ", ".join(f"{c.task_id}({c.model_class.value})" for c in self.children)
+            f"[{self.task_id}] ({self.domain}) phase1 workers: "
+            + ", ".join(f"{c.task_id}({c.model_class.value})" for c in phase1_children)
         )
+        await asyncio.gather(*[child.run(semaphore) for child in phase1_children])
 
-        # Workers run in parallel
-        await asyncio.gather(*[child.run(semaphore) for child in self.children])
+        # ── Phase 2: dependent workers wait for sibling bin files, then read manifest ──
+        if phase2_specs:
+            bin_dir = pathlib.Path(self.workspace_path).parent / "bin"
 
-        # File-owner audit — upward-heavy: ANALYST audits its own workers
+            # Map fn_name → task_id of the phase1 worker that owns it
+            fn_to_task_id: dict[str, str] = {}
+            for child in phase1_children:
+                fn = child._contract.get("fn_name", "")
+                if fn:
+                    fn_to_task_id[fn] = child.task_id
+
+            async def _spawn_phase2_worker(orig_index: int, ws: dict) -> None:
+                calls = ws.get("contract", {}).get("calls", {})
+                # Wait for each dependency's bin file (max 60s)
+                deadline = time.time() + 60.0
+                dep_task_ids = [fn_to_task_id[fn] for fn in calls if fn in fn_to_task_id]
+                while dep_task_ids and time.time() < deadline:
+                    if all((bin_dir / f"{tid}.py").exists() for tid in dep_task_ids):
+                        break
+                    await asyncio.sleep(0.5)
+                else:
+                    if dep_task_ids and not all((bin_dir / f"{tid}.py").exists() for tid in dep_task_ids):
+                        _debug_log(f"[{self.task_id}] phase2 worker {orig_index} timed out waiting for deps")
+
+                # Read manifest and resolve actual signatures for calls
+                manifest = _manifest_read(self.workspace_path)
+                real_calls: dict[str, str] = {}
+                for callee_fn, planned_sig in calls.items():
+                    # Find this callee in the manifest by fn_name within same domain
+                    actual_sig = next(
+                        (v["signature"] for v in manifest.values()
+                         if v.get("fn_name") == callee_fn and v.get("domain") == self.domain),
+                        planned_sig,  # fall back to planned if not yet written
+                    )
+                    real_calls[callee_fn] = actual_sig
+
+                updated_ws = {**ws, "contract": {**ws.get("contract", {}), "calls": real_calls}}
+                child = _make_worker_node(updated_ws, orig_index)
+                self.children.append(child)
+                self._emit()
+                _debug_log(
+                    f"[{self.task_id}] phase2 spawning {child.task_id} "
+                    f"with resolved calls: {real_calls}"
+                )
+                await child.run(semaphore)
+
+            await asyncio.gather(*[_spawn_phase2_worker(i, ws) for i, ws in phase2_specs])
+
+        # Run auditor (self acts as auditor coordinator)
         self.status = AgentStatus.MERGING
         self._emit()
-        self.result = await self._merge(
-            model_class=ModelClass.ANALYST,
-            is_file_owner=True,
-        )
-        # Sanity-check analyst result quality; fall back to raw worker concat if broken.
-        _unk_count = self.result.count("<unk>")
-        _unk_ratio = _unk_count / max(len(self.result), 1)
-        _tq_dq = self.result.count('"""')
-        _tq_sq = self.result.count("'''")
-        _analyst_bad = (_unk_ratio > 0.01 or _unk_count > 5
-                        or _tq_dq % 2 != 0 or _tq_sq % 2 != 0)
-        if _analyst_bad:
-            _debug_log(f"[{self.task_id}] analyst result invalid (unk={_unk_ratio:.3f}, tq={_tq_count}), using raw worker concat")
-            self.result = "\n\n".join(c.result for c in self.children if c.result)
+        await self._auditor_run(semaphore)
+
+        # Collect approved results from bin files
+        import ast as _ast_fo
+        approved_code = []
+        for child in self.children:
+            bin_file = pathlib.Path(self.workspace_path).parent / "bin" / f"{child.task_id}.py"
+            if bin_file.exists() and bin_file.read_text().strip():
+                code = bin_file.read_text().strip()
+                try:
+                    _ast_fo.parse(code)
+                    approved_code.append(code)
+                except SyntaxError:
+                    _debug_log(f"[{self.task_id}] dropping {child.task_id}: still invalid after audit")
+
+        self.result = "\n\n".join(approved_code)
         if self.workspace_path:
             _append_workspace(self.workspace_path, f"{self.task_id}({self.domain})", self.result)
         self.status = AgentStatus.DONE
@@ -856,9 +1185,227 @@ class AgentNode:
         answer = await self._execute_runs(answer, model_class=self.model_class)
         if self.workspace_path:
             _append_workspace(self.workspace_path, self.task_id, answer)
+            # Write extracted code to bin/{task_id}.py
+            bin_dir = pathlib.Path(self.workspace_path).parent / "bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            bin_file = bin_dir / f"{self.task_id}.py"
+            code = _extract_code_for_bin(answer)
+            bin_file.write_text(code)
+            _debug_log(f"[{self.task_id}] wrote bin/{self.task_id}.py ({bin_file.stat().st_size} bytes)")
+            # Write manifest entry — actual signature extracted from real output
+            _sig = _extract_signature(code)
+            _fn = self._contract.get("fn_name", "")
+            if _sig and _fn:
+                _manifest_write_entry(self.workspace_path, self.task_id, _fn, _sig, self.domain)
+                _debug_log(f"[{self.task_id}] manifest: {_fn} → {_sig}")
         self.result = answer
         self.status = AgentStatus.DONE
         self._emit()
+
+    # ── Auditor: syntax + LLM check, up to 3 rounds ─────────────────────────
+
+    async def _auditor_run(self, semaphore: asyncio.Semaphore):
+        """Audit all workers under this file_owner. Retries up to MAX_ROUNDS."""
+        import ast as _ast_audit
+        MAX_ROUNDS = 3
+        ws = pathlib.Path(self.workspace_path).parent
+
+        for round_num in range(MAX_ROUNDS):
+            failed_workers: list[tuple["AgentNode", str]] = []
+
+            for worker in self.children:
+                bin_file = ws / "bin" / f"{worker.task_id}.py"
+                if not bin_file.exists() or not bin_file.read_text().strip():
+                    failed_workers.append((worker, "empty output"))
+                    continue
+
+                code = bin_file.read_text()
+
+                # Step 1: cheap syntax check
+                try:
+                    _ast_audit.parse(code)
+                except SyntaxError as e:
+                    failed_workers.append((worker, f"SyntaxError: {e}"))
+                    continue
+                # passes syntax
+
+            failed_ids = {id(fw) for fw, _ in failed_workers}
+
+            if not failed_workers:
+                _debug_log(f"[{self.task_id}] audit round {round_num+1}: all workers passed")
+                break
+
+            # Step 2: LLM review of all passing files together
+            passing_workers = [w for w in self.children if id(w) not in failed_ids]
+            if passing_workers:
+                combined = ""
+                for w in passing_workers:
+                    code = (ws / "bin" / f"{w.task_id}.py").read_text()
+                    combined += f"# --- {w.domain} ({w.task_id}) ---\n{code}\n\n"
+
+                llm_issues = await self._audit_llm(combined, semaphore)
+                for task_id, issue in llm_issues:
+                    worker = next((w for w in self.children if w.task_id == task_id), None)
+                    if worker and id(worker) not in failed_ids:
+                        failed_workers.append((worker, f"LLM audit: {issue}"))
+                        failed_ids.add(id(worker))
+
+            if not failed_workers:
+                _debug_log(f"[{self.task_id}] audit round {round_num+1}: LLM pass — all clean")
+                break
+
+            if round_num == MAX_ROUNDS - 1:
+                # Out of budget — log and skip failed workers
+                for worker, reason in failed_workers:
+                    _debug_log(
+                        f"[{self.task_id}] audit: giving up on {worker.task_id} "
+                        f"after {MAX_ROUNDS} rounds: {reason}"
+                    )
+                break
+
+            # Relaunch failed workers with feedback
+            _debug_log(
+                f"[{self.task_id}] audit round {round_num+1}: "
+                f"{len(failed_workers)} workers need retry"
+            )
+            for worker, reason in failed_workers:
+                worker.status = AgentStatus.PENDING
+                bin_file = ws / "bin" / f"{worker.task_id}.py"
+                existing_code = bin_file.read_text() if bin_file.exists() else ""
+                worker._audit_feedback = (
+                    f"Previous attempt failed: {reason}\n"
+                    f"Your previous code:\n```python\n{existing_code}\n```\n"
+                    "Please fix the issue and rewrite the complete function."
+                )
+
+            await asyncio.gather(*[w.run(semaphore) for w, _ in failed_workers])
+
+    async def _brief_workers(
+        self, worker_specs: list[dict], semaphore: asyncio.Semaphore
+    ) -> list[dict]:
+        """
+        File owner compiles a structured JSON contract per worker via one LLM call.
+        Each contract has: fn_name, signature, what, calls (callee→sig), forbidden.
+        Returns worker_specs with a 'contract' key added to each entry.
+        Falls back to minimal contracts parsed from task text if LLM call fails.
+        """
+        iface_note = f"\nInterface contract: {self._interfaces}" if self._interfaces else ""
+
+        # Build a sibling signature note — all known fn signatures from other domains
+        sibling_note = ""
+        if self._sibling_sigs:
+            sibling_lines = "\n".join(
+                f"  {sig}  {'[returns None — mutates in-place]' if '-> None' in sig or sig.rstrip().endswith('None') else '[returns a value]'}"
+                for sig in self._sibling_sigs.values()
+            )
+            sibling_note = f"\n\nAll functions available in scope (from other domains):\n{sibling_lines}"
+
+        worker_list = "\n".join(
+            f"{i+1}. {ws['task']}" for i, ws in enumerate(worker_specs)
+        )
+        system = (
+            "You are a contract compiler for a multi-agent code system.\n"
+            "Output a JSON array — one object per function — and NOTHING ELSE. No prose, no fences.\n\n"
+            "Each object must have exactly these keys:\n"
+            "  fn_name    : bare function name (no parens)\n"
+            "  signature  : full def line, single line, exact params and return type\n"
+            "  what       : 2-3 sentences describing what the function must do. "
+            "If the function calls others, state exactly HOW each callee is called "
+            "(e.g. 'call add_task(tasks, desc) as a statement — it mutates tasks in-place and returns None').\n"
+            "  calls      : object mapping each callee fn_name to its EXACT def signature — "
+            "look up the signature in the 'All functions available in scope' list above. "
+            "If a callee is not in that list, infer it from the task hint. NEVER leave a signature empty.\n"
+            "  forbidden  : list of strings — things this worker must NOT do\n\n"
+            "CRITICAL RULES FOR forbidden — you MUST include these for every function:\n"
+            "  • For every callee in 'calls' whose signature ends in '-> None': add "
+            "\"assign result of <fn_name> — it returns None, call as bare statement only, e.g. fn(x) not x = fn(x)\".\n"
+            "  • For every callee in 'calls' that takes a mutable container (list, dict) as first arg "
+            "and returns None: add \"reassign the container after calling <fn_name>\".\n"
+            "  • Always add \"reimplement any function listed in calls\".\n\n"
+            "The array must have exactly as many entries as input functions, same order."
+        )
+        user = (
+            f"Domain: {self.domain}\n"
+            f"Domain task: {self.task}{iface_note}{sibling_note}\n\n"
+            f"Functions ({len(worker_specs)}):\n{worker_list}"
+        )
+
+        def _minimal_contract(ws: dict, index: int) -> dict:
+            """Fallback: build a minimal contract from the task text."""
+            task = ws["task"]
+            sig_m = re.search(r'(def \w+\((?:[^()]*|\[[^\[\]]*\])*\)\s*(?:->\s*[^\n:]+)?)', task)
+            sig = sig_m.group(1).strip() if sig_m else ""
+            fn_m = re.search(r'def (\w+)\s*\(', sig)
+            fn_name = fn_m.group(1) if fn_m else f"fn_{index+1}"
+            calls_m = re.search(r'[Cc]alls?:\s*\[([^\]]+)\]', task)
+            calls_list = [c.strip() for c in calls_m.group(1).split(",")] if calls_m else []
+            return {
+                "fn_name": fn_name,
+                "signature": sig,
+                "what": task,
+                "calls": {fn: "" for fn in calls_list},
+                "forbidden": [],
+            }
+
+        contracts: list[dict] = []
+        try:
+            async with semaphore:
+                raw = await chat(
+                    [{"role": "user", "content": user}],
+                    system=system,
+                    temperature=0.2,
+                    max_tokens=3000,
+                    model_class=ModelClass.ANALYST,
+                )
+            # Strip think blocks and fences
+            clean = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            if clean.startswith("```"):
+                lines = clean.split("\n")
+                clean = "\n".join(l for l in lines[1:] if l.strip() != "```")
+            parsed = json.loads(clean)
+            if isinstance(parsed, list) and len(parsed) == len(worker_specs):
+                contracts = parsed
+                _debug_log(f"[{self.task_id}] compiled {len(contracts)} contracts for '{self.domain}'")
+            else:
+                raise ValueError(f"expected {len(worker_specs)} contracts, got {len(parsed) if isinstance(parsed, list) else type(parsed)}")
+        except Exception as e:
+            _debug_log(f"[{self.task_id}] _brief_workers contract parse failed ({e}), using minimal contracts")
+            contracts = [_minimal_contract(ws, i) for i, ws in enumerate(worker_specs)]
+
+        return [{**ws, "contract": contracts[i]} for i, ws in enumerate(worker_specs)]
+
+    async def _audit_llm(
+        self, combined_code: str, semaphore: asyncio.Semaphore
+    ) -> list[tuple[str, str]]:
+        """Ask LLM to review combined code. Returns list of (task_id, issue)."""
+        iface_note = f"\nInterface contract: {self._interfaces}" if self._interfaces else ""
+        system = (
+            "You are a code auditor. Review these functions for: "
+            "(1) signature mismatches with the interface contract, "
+            "(2) obvious logic bugs, "
+            "(3) stub placeholders (... or pass-only bodies). "
+            "For each problem found, output ONLY lines in format: FAIL task_id: reason. "
+            "If all functions are correct output: PASS"
+            + iface_note
+        )
+        async with semaphore:
+            raw = await chat(
+                [{"role": "user", "content": combined_code}],
+                system=system,
+                temperature=0.2,
+                max_tokens=1024,
+                model_class=ModelClass.ANALYST,
+            )
+        issues: list[tuple[str, str]] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("FAIL "):
+                rest = line[5:]  # strip "FAIL "
+                if ": " in rest:
+                    task_id, reason = rest.split(": ", 1)
+                    issues.append((task_id.strip(), reason.strip()))
+        _debug_log(f"[{self.task_id}] _audit_llm: {len(issues)} issues found")
+        return issues
 
     # ── Solve helpers ─────────────────────────────────────────────────────────
 
@@ -903,49 +1450,148 @@ class AgentNode:
         if (self.role == AgentRole.WORKER
                 and self.output_shape in (OutputShape.SINGLE_FILE, OutputShape.MULTI_FILE)
                 and self.is_project):
-            if self._interfaces:
-                iface_note = (
-                    "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "ENFORCED CONTRACT — your code MUST satisfy these:\n"
-                    f"{self._interfaces}\n"
-                    "Any variable, type, or value that contradicts the above is a bug.\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            import re as _re
+
+            if self._task_type == "debug" and self._source_file:
+                # ── DEBUG WORKER: fix one specific bug in the source file ─────
+                sig_m = _re.search(r'(def \w+\([^)]*\)\s*(?:->\s*[^\n:]+)?)', self.task)
+                sig_line = sig_m.group(1).strip() if sig_m else ""
+
+                system = "\n".join(filter(None, [
+                    "You are a single-function bug-fix worker. These constraints are ABSOLUTE:",
+                    f"SIGNATURE: {sig_line}" if sig_line else "",
+                    "• Output ONLY the corrected function — exact same name and signature as above.",
+                    "• Do NOT output the entire file. One function only.",
+                    "• Wrap output in ONE fenced block: ```python\n<fixed function>\n```",
+                ]))
+
+                worker_scope = (
+                    "YOU ARE A BUG-FIX WORKER. You will receive the full source file for context "
+                    "and a specific bug to fix. Output ONLY the corrected function — nothing else.\n\n"
+                    "RULES:\n"
+                    "• Fix the exact bug described — do not change anything else\n"
+                    "• Keep the exact same function name and signature\n"
+                    "• Write ONLY that one function — no other functions, no main block\n"
+                    "• Wrap output in ONE fenced block: ```python\n<fixed function>\n```"
                 )
+
             else:
-                iface_note = ""
-            worker_scope = (
-                "\n\nYOU ARE A SINGLE-FUNCTION WORKER. Your only job is to implement the ONE "
-                "function whose exact signature is stated in the task. Nothing else.\n\n"
-                "STRICT RULES:\n"
-                "• Write ONLY that one function — its def line, body, and any stdlib imports it needs\n"
-                "• Use the EXACT function name, parameter names, and return type from the task signature\n"
-                "• The implementation must be complete — no `pass`, no `...`, no placeholders\n"
-                "• Do NOT write a second function, a class, a main block, or example usage\n"
-                "• Do NOT reimplement functions other workers own — call them by their exact name\n"
-                "• If your function needs a small helper, define it as a nested def INSIDE your function\n"
-                "• Do NOT add `from <module> import` for things defined in this same project — "
-                "all functions are in one file and are already in scope\n"
-                "• Wrap your output in ONE fenced block: ```python\\n<your function>\\n```"
-                + iface_note
-            )
+                # ── GENERATE WORKER ───────────────────────────────────────────
+                if self._contract:
+                    # Contract JSON from _brief_workers — the primary path
+                    # calls dict may have been resolved with real manifest signatures by phase2
+                    contract_json = json.dumps(self._contract, indent=2)
+                    iface_line = f"\nINTERFACE CONTRACT:\n{self._interfaces}" if self._interfaces else ""
+
+                    # Build a callee cheat-sheet: every function in calls, annotated with call semantics
+                    calls = self._contract.get("calls", {})
+                    callee_lines = []
+                    for callee_fn, callee_sig in calls.items():
+                        if not callee_sig:
+                            # fall back to sibling_sigs if contract left it empty
+                            callee_sig = self._sibling_sigs.get(callee_fn, "")
+                        if callee_sig:
+                            returns_none = callee_sig.rstrip().endswith("None") or "-> None" in callee_sig
+                            note = "CALL AS STATEMENT — returns None, mutates in-place" if returns_none else "CALL AND USE RETURN VALUE"
+                            callee_lines.append(f"  {callee_sig}  # {note}")
+                    callee_ref = ("\n\nCALLEE REFERENCE — these functions are already in scope:\n"
+                                  + "\n".join(callee_lines)) if callee_lines else ""
+
+                    system = (
+                        "You are a single-function code worker. "
+                        "Your contract is below as JSON. Every field is ABSOLUTE — no deviations.\n\n"
+                        f"{contract_json}"
+                        f"{callee_ref}"
+                        f"{iface_line}\n\n"
+                        "RULES:\n"
+                        "• Implement exactly fn_name with the exact signature shown.\n"
+                        "• Every function in 'calls' already exists in scope — call it by that exact name "
+                        "with the exact parameters shown. DO NOT reimplement it.\n"
+                        "• CRITICAL: If a callee is annotated '# CALL AS STATEMENT', call it as a bare "
+                        "statement — NEVER assign its result. E.g. `add_task(tasks, desc)` not `tasks = add_task(tasks, desc)`.\n"
+                        "• Do not violate any item in 'forbidden'.\n"
+                        "• CRITICAL: If your function needs to match triple backticks (e.g. markdown fence detection), "
+                        "NEVER write raw ``` inside a string literal — use '`' * 3 or chr(96) * 3 instead. "
+                        "Raw triple backticks truncate the output fence and corrupt your response.\n"
+                        "• Output ONE fenced python block: ```python\n<your function>\n```"
+                    )
+                else:
+                    # Fallback: no contract (simple tasks, non-project workers)
+                    sig_m = _re.search(r'(def \w+\([^)]*\)\s*(?:->\s*[^\n:]+)?)', self.task)
+                    sig_line = sig_m.group(1).strip() if sig_m else ""
+                    contract_lines = [
+                        "You are a single-function code worker. These constraints are ABSOLUTE:",
+                        f"SIGNATURE: {sig_line}" if sig_line else "",
+                        "• Function name, parameter names, parameter count, return type — EXACT match to SIGNATURE.",
+                    ]
+                    if self._interfaces:
+                        contract_lines += ["CONTRACT:", self._interfaces]
+                    system = "\n".join(l for l in contract_lines if l)
+
+                worker_scope = (
+                    "YOU ARE A SINGLE-FUNCTION WORKER. Implement exactly the one function in your contract.\n\n"
+                    "RULES:\n"
+                    "• Write ONLY that function — def line, body, stdlib imports only\n"
+                    "• Complete implementation — no pass, no ..., no placeholders\n"
+                    "• Do NOT write a second function, class, main block, or example usage\n"
+                    "• Do NOT reimplement functions listed in 'calls' — call them by exact name\n"
+                    "• Nested helpers go INSIDE your function as nested defs\n"
+                    "• Do NOT import project functions — they are already in scope\n"
+                    "• CRITICAL: If a callee's signature ends in '-> None', it mutates in-place and "
+                    "returns nothing — call it as a statement, NEVER assign its result (e.g. 'fn(x)' not 'x = fn(x)')\n"
+                    "• CRITICAL: If your function needs to check for triple backticks (e.g. markdown fences), "
+                    "NEVER write raw ``` in a string literal — use '`' * 3 or chr(96) * 3 instead. "
+                    "Raw triple backticks inside your code will break the output fence and truncate your response.\n"
+                    "• Wrap output in ONE fenced block: ```python\n<your function>\n```"
+                )
         else:
+            system = (
+                "You are a HiveMind agent. Solve the task completely and directly. "
+                "Do not ask clarifying questions — do your best with the information given."
+                + domain_context
+                + file_hint
+            )
             worker_scope = ""
 
-        system = (
-            "You are a HiveMind agent. Solve the task completely and directly. "
-            "Do not ask clarifying questions — do your best with the information given."
-            + domain_context
-            + worker_scope
-            + file_hint
-        )
         # Scale token budget by role + model class
-        # analyst-class workers handle complex functions and need more room
         if self.role == AgentRole.WORKER:
             _max_tok = 8000 if self.model_class == ModelClass.ANALYST else 6000
         else:
             _max_tok = 2048
+
+        if self.role == AgentRole.WORKER and self.is_project:
+            if self._task_type == "debug" and self._source_file:
+                # Extract just the target function from source to stay within token limits.
+                # The function name comes from the first `def fn_name` in the task description.
+                import re as _re2
+                _fn_m = _re2.search(r'def (\w+)\s*\(', self.task)
+                _fn_name = _fn_m.group(1) if _fn_m else None
+                if _fn_name:
+                    _fn_pattern = re.compile(
+                        rf'^(def {re.escape(_fn_name)}\s*\(.*?)(?=\n^(?:def |class )|\Z)',
+                        re.DOTALL | re.MULTILINE,
+                    )
+                    _fn_m2 = _fn_pattern.search(self._source_file)
+                    _fn_context = f"```python\n{_fn_m2.group(0).strip()}\n```" if _fn_m2 else "(function not found in source)"
+                else:
+                    _fn_context = "(could not identify target function)"
+                user_prompt = (
+                    f"{worker_scope}\n\n"
+                    f"Current (broken) function:\n{_fn_context}\n\n"
+                    f"Bug to fix: {self.task}{ws_context}"
+                )
+            else:
+                user_prompt = f"{worker_scope}\n\nTask: {self.task}{ws_context}"
+        else:
+            user_prompt = f"Task: {self.task}{ws_context}"
+
+        audit_fb = getattr(self, "_audit_feedback", "")
+        if audit_fb:
+            user_prompt += f"\n\n{audit_fb}"
+
         return await chat(
-            [{"role": "user", "content": f"Task: {self.task}{ws_context}"}],
+            [{"role": "user", "content": user_prompt}],
             system=system,
             temperature=0.4,
             max_tokens=_max_tok,
@@ -1072,11 +1718,11 @@ class AgentNode:
             if _first_fence != -1 and _last_fence != _first_fence:
                 raw = raw[_first_fence:_last_fence + 3]
             # Extract fenced code blocks — skip shell/prose blocks, take largest code block
-            fenced_blocks = _FENCED_LANG.findall(raw)
+            fenced_blocks = _extract_fenced_blocks(raw)
             code_blocks = [
                 body.strip()
                 for lang_tag, body in fenced_blocks
-                if lang_tag.split()[0].lower() not in _SKIP_LANGS and body.strip()
+                if (lang_tag.split()[0].lower() if lang_tag else "") not in _SKIP_LANGS and body.strip()
             ]
             if code_blocks:
                 # Join all code blocks; if one block is ≥ 80% of total, use it alone
@@ -1209,6 +1855,50 @@ class AgentNode:
 
         _debug_log(f"[{self.task_id}] concatenation ({lang}): {len(assembled)} chars → {fname}")
         return f"```{lang} {fname}\n{assembled}\n```"
+
+    # ── Debug splice ──────────────────────────────────────────────────────────
+
+    def _splice_debug_fixes(self, sections: list[str]) -> str:
+        """
+        Replace functions in the source file with fixed versions from workers.
+        Each section is a worker's output containing one corrected function.
+        Functions are matched by name and replaced in-place.
+        """
+        import ast as _ast
+
+        result = self._source_file
+
+        for section in sections:
+            # Extract the fixed function code from the section
+            code = _extract_code_for_bin(section)
+            if not code.strip():
+                continue
+
+            # Find the function name in the fixed code
+            fn_m = re.search(r'^def (\w+)\s*\(', code, re.MULTILINE)
+            if not fn_m:
+                _debug_log(f"[{self.task_id}] splice: no function found in section, skipping")
+                continue
+            fn_name = fn_m.group(1)
+
+            # Find the function in the source file and replace it
+            # Match: def fn_name(...): ... up to the next top-level def/class or EOF
+            pattern = re.compile(
+                rf'^(def {re.escape(fn_name)}\s*\(.*?)(?=\n^(?:def |class )|\Z)',
+                re.DOTALL | re.MULTILINE,
+            )
+            if pattern.search(result):
+                result = pattern.sub(code.rstrip(), result, count=1)
+                _debug_log(f"[{self.task_id}] splice: replaced {fn_name}")
+            else:
+                # Function not found in source — append it
+                result = result.rstrip() + "\n\n" + code.strip() + "\n"
+                _debug_log(f"[{self.task_id}] splice: {fn_name} not found in source, appended")
+
+        # Deduplicate top-level functions: if the same name appears twice (old + new),
+        # keep the last definition. Split on `\ndef ` boundaries at column 0.
+        result = _dedup_top_level_fns(result)
+        return result
 
     # ── Tree helpers ──────────────────────────────────────────────────────────
 
