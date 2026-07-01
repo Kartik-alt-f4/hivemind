@@ -1,100 +1,69 @@
 """
-LLM Client - async wrapper around any OpenAI-compatible endpoint
-with automatic key rotation and retry on rate-limit errors.
+LLM Client — async wrapper around any OpenAI-compatible endpoint.
 
-V-shape tier routing:
-  Going DOWN the tree:  depth 0 → tier 0, depth 1 → tier 1, depth N → tier N
-  Coming UP (merges):   depth 0 merge → tier 0, depth 1 merge → tier 1, etc.
-  Leaf nodes resolve to tier 0 (same as root) because their tier_idx is clamped
-  to the lightest available tier, then the merge pass at the same depth rises
-  back — so root and leaves both use the strongest model, middle uses lighter.
+Dispatch is now class-based, not depth-based:
+  chat(..., model_class=ModelClass.ORCHESTRATOR)  → strongest available
+  chat(..., model_class=ModelClass.WORKER)        → light execution model
+  etc.
 
-  tier_for_depth(depth, max_depth, num_tiers) maps depth to a tier index
-  where 0 = strongest. Both plan (going down) and merge (going up) use this
-  same function — the caller passes `merge=True` to mirror the index.
+The caller decides which class is appropriate for the task type.
+Automatic key rotation and exponential backoff on 429s are preserved.
 """
 import asyncio
 import json
+import sys
 import httpx
+
 from core.providers import get_pool, Provider, AllProvidersExhausted
+from core.model_classes import ModelClass
 
 
 MAX_RETRIES = 6
 RETRY_DELAY = 1.0
 
 
-def tier_for_depth(depth: int, max_depth: int, num_tiers: int, merge: bool = False) -> int:
-    """
-    Map tree depth to a quality tier index (0 = strongest, num_tiers-1 = lightest).
-
-    Going down (merge=False): depth 0 → tier 0, deeper → higher tier index (lighter).
-    Going up   (merge=True):  mirrors — depth 0 merge → tier 0, deeper merge → lighter.
-
-    Both root plan (depth 0) and leaf solve (depth == max_depth) land at tier 0
-    because the deepest depth maps to num_tiers-1 on the way down, but leaf
-    solves use prefer_root=True which overrides to tier 0 directly.
-
-    The V bottom is at max_depth//2 where the lightest model is used.
-    """
-    if num_tiers <= 1:
-        return 0
-    # Normalise depth to [0, 1] range
-    half = max(1, max_depth)
-    ratio = min(depth / half, 1.0)
-    if merge:
-        # Coming back up: deepest merge = lightest, shallowest merge = strongest
-        tier = round(ratio * (num_tiers - 1))
-    else:
-        # Going down: root = strongest, deeper = lighter
-        tier = round(ratio * (num_tiers - 1))
-    return min(tier, num_tiers - 1)
-
-
 async def chat(
     messages: list[dict],
     system: str = "",
     temperature: float = 0.4,
-    max_tokens: int = 2048,
+    max_tokens: int = 1024,
     provider: Provider | None = None,
+    model_class: ModelClass = ModelClass.WORKER,
+    # ── Legacy compat (ignored — kept so old call sites don't crash) ──────────
     depth: int = 0,
     max_depth: int = 6,
-    prefer_root: bool = False,   # force tier 0 (leaf nodes, root orchestration)
-    prefer_merge: bool = False,  # merge pass — mirrors depth back up the V
+    prefer_root: bool = False,
+    prefer_merge: bool = False,
 ) -> str:
     """
-    Send a chat completion request. Returns the assistant's reply as a string.
+    Send a chat completion. Returns the assistant reply as a string.
 
-    Tier selection (V-shape):
-      prefer_root=True  → tier 0 (strongest) — used for root plan and leaf solves
-      prefer_merge=True → tier mirrored by depth going back up — used for all merges
-      default           → tier by depth going down — lighter toward the middle
+    model_class controls which provider bucket is used.
+    Legacy prefer_root=True is mapped to ORCHESTRATOR for compatibility.
     """
-    import sys
     pool = get_pool()
-    num_tiers = pool.num_tiers()
     delay = RETRY_DELAY
     last_error = "unknown"
 
-    # Resolve which provider to use
-    if prefer_root or depth == 0:
-        use_provider = pool.provider_for_tier(0)
-    elif prefer_merge:
-        tier = tier_for_depth(depth, max_depth, num_tiers, merge=True)
-        use_provider = pool.provider_for_tier(tier)
+    # Legacy compat: prefer_root → ORCHESTRATOR
+    if prefer_root:
+        model_class = ModelClass.ORCHESTRATOR
+
+    # Resolve provider once; retry may escalate through pool
+    if provider is not None:
+        pinned = provider
     else:
-        tier = tier_for_depth(depth, max_depth, num_tiers, merge=False)
-        use_provider = pool.provider_for_tier(tier)
+        pinned = pool.for_class(model_class)
 
-    import sys as _sys
-    _mode = "root" if (prefer_root or depth == 0) else ("merge" if prefer_merge else f"depth{depth}")
-    print(f"\033[2m[llm] {_mode} → {use_provider.name}({use_provider.model.split('/')[-1]})\033[0m",
-          file=_sys.stderr)
+    _log_mode = model_class.value
+    print(
+        f"\033[2m[llm] {_log_mode} → {pinned.name}({pinned.model.split('/')[-1]})\033[0m",
+        file=sys.stderr,
+    )
 
-    pinned = use_provider  # remember the chosen provider across retries
     pinned_tried = False
 
     for attempt in range(MAX_RETRIES):
-        # First attempt: use the resolved tier provider
         if not pinned_tried:
             p = pinned
             pinned_tried = True
@@ -108,7 +77,7 @@ async def chat(
                     "All API keys are currently rate-limited. "
                     "Please wait a moment or add more keys to your .env."
                 )
-            p = pool.next_provider()
+            p = pool.for_class(model_class)
             api_key = p.best_key()
             if api_key is None:
                 continue
@@ -140,12 +109,9 @@ async def chat(
                 p.errors += 1
                 print(
                     f"\033[2m[llm] 429 on {p.name} key …{api_key.value[-6:]} "
-                    f"({sum(1 for k in p.api_keys if k.is_available())} keys left in provider)\033[0m",
+                    f"({sum(1 for k in p.api_keys if k.is_available())} keys left)\033[0m",
                     file=sys.stderr,
                 )
-                if p is pinned:
-                    print(f"\033[2m[llm] {p.name} 429 — falling back to pool\033[0m",
-                          file=sys.stderr)
                 if not pool.any_available():
                     raise AllProvidersExhausted(
                         "All API keys are currently rate-limited. "
@@ -156,23 +122,29 @@ async def chat(
                 provider = None
                 continue
 
-            if resp.status_code == 400:
+            if resp.status_code in (400, 401, 413, 503):
                 p.errors += 1
                 try:
                     detail = resp.json()
                 except Exception:
                     detail = resp.text[:200]
-                last_error = f"400 from {p.name}: {detail}"
-                if p is pinned:
-                    print(f"\033[2m[llm] {p.name} 400 — falling back to pool\033[0m",
-                          file=sys.stderr)
+                last_error = f"{resp.status_code} from {p.name}: {detail}"
+                print(f"\033[2m[llm] {p.name} {resp.status_code} — falling back\033[0m", file=sys.stderr)
                 provider = None
                 continue
 
             resp.raise_for_status()
             data = resp.json()
+            content = data["choices"][0]["message"].get("content") if data.get("choices") else None
+            if not content:
+                # Empty completion (e.g. Gemini max_tokens too tight) — treat as 400
+                p.errors += 1
+                last_error = f"empty completion from {p.name} (finish_reason={data['choices'][0].get('finish_reason','?')})"
+                print(f"\033[2m[llm] {p.name} empty response — falling back\033[0m", file=sys.stderr)
+                provider = None
+                continue
             api_key.calls += 1
-            return data["choices"][0]["message"]["content"]
+            return content
 
         except AllProvidersExhausted:
             raise
@@ -180,11 +152,12 @@ async def chat(
         except (httpx.ConnectError, httpx.TimeoutException, KeyError) as e:
             p.errors += 1
             last_error = str(e)
-            if p is pinned:
-                print(f"\033[2m[llm] {p.name} error ({e.__class__.__name__}) — falling back\033[0m",
-                      file=sys.stderr)
+            print(f"\033[2m[llm] {p.name} error ({e.__class__.__name__}) — falling back\033[0m",
+                  file=sys.stderr)
             if attempt == MAX_RETRIES - 1:
-                raise RuntimeError(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
+                raise RuntimeError(
+                    f"LLM call failed after {MAX_RETRIES} attempts: {last_error}"
+                )
             await asyncio.sleep(delay)
             delay *= 2
             provider = None
@@ -197,9 +170,13 @@ async def chat_json(
     system: str = "",
     temperature: float = 0.2,
     max_tokens: int = 1024,
+    model_class: ModelClass = ModelClass.ANALYST,
 ) -> dict:
     """Like chat() but parses the response as JSON."""
-    raw = await chat(messages, system=system, temperature=temperature, max_tokens=max_tokens)
+    raw = await chat(
+        messages, system=system, temperature=temperature,
+        max_tokens=max_tokens, model_class=model_class,
+    )
     clean = raw.strip()
 
     if clean.startswith("```"):
@@ -252,4 +229,6 @@ async def chat_json(
 
     except json.JSONDecodeError as e:
         _log("PARSE FAILED", f"{e}\nCLEAN: {clean}")
-        raise ValueError(f"Could not parse JSON from model response: {e}\nRaw: {raw[:300]}")
+        raise ValueError(
+            f"Could not parse JSON from model response: {e}\nRaw: {raw[:300]}"
+        )

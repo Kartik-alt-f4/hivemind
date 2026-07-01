@@ -120,9 +120,7 @@ async def health():
     try:
         from core.providers import get_pool
         pool = get_pool()
-        providers = [p.name for p in pool.providers]
-        if pool.root_provider:
-            providers = ["ROOT"] + providers
+        providers = [f"{p.name}({p.model_class.value})" for p in pool.tiers]
         return {"ok": True, "providers": providers, "tokens": METER.snapshot()}
     except Exception as e:
         return {"ok": False, "error": str(e), "providers": [], "tokens": METER.snapshot()}
@@ -143,7 +141,7 @@ async def sudo_input(body: dict):
 async def _run_task(task: str, cwd: str | None = None, request_id: str | None = None) -> AsyncIterator[dict]:
     """Run a HiveMind task and yield status/result dicts as it progresses."""
     import uuid as _uuid
-    from agents.node import AgentNode, _agent_registry
+    from agents.node import AgentNode, AgentRole, _agent_registry
     import agents.node as _node_module
     from core.providers import get_pool
     from pathlib import Path
@@ -181,6 +179,8 @@ async def _run_task(task: str, cwd: str | None = None, request_id: str | None = 
             "parent_id": node.parent_id,
             "task": node.task[:80],
             "state": node.status.value,
+            "role": node.role.value,
+            "domain": getattr(node, "domain", ""),
             "depth": node.depth,
             "child_ids": [c.task_id for c in node.children],
             "elapsed": round(node.elapsed(), 1),
@@ -200,7 +200,8 @@ async def _run_task(task: str, cwd: str | None = None, request_id: str | None = 
 
     output_dir = Path(cwd) if cwd else None
     root = AgentNode(
-        task=task, depth=0, max_depth=5,
+        task=task, depth=0,
+        role=AgentRole.ORCHESTRATOR,
         output_dir=output_dir,
         sudo_callback=sudo_callback,
         on_shell_run=on_shell_run,

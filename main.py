@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-HiveMind — Recursive Multi-Agent CLI
+HiveMind — Recursive Multi-Agent CLI (v2)
+
+Standalone entry point that runs the agent cluster directly (no server).
+For the widget/server interface use: widget_server.py + hm.py
 """
 import asyncio
 import os
@@ -11,7 +14,6 @@ from rich.console import Console
 from rich.prompt import Prompt
 from rich.panel import Panel
 from rich.text import Text
-from rich.syntax import Syntax
 
 console = Console()
 
@@ -19,11 +21,11 @@ console = Console()
 def print_banner():
     console.print(Panel(
         Text.assemble(
-            ("⬡ HIVEMIND\n", "bold cyan"),
+            ("⬡ HIVEMIND v2\n", "bold cyan"),
             ("Recursive Agent Cluster\n", "dim white"),
             ("─────────────────────────────\n", "dim"),
-            ("Any OpenAI-compatible backend · Dynamic task splitting\n", "dim white"),
-            ("Key rotation · Parallel execution · Live tree view", "dim white"),
+            ("orchestrator → file_owners → workers → audit → merge\n", "dim white"),
+            ("Downward-light · Upward-heavy · Output-shape-aware", "dim white"),
         ),
         border_style="cyan",
         padding=(1, 4),
@@ -33,83 +35,75 @@ def print_banner():
 def ensure_env():
     env_path = Path(".env")
     example_path = Path(".env.example")
-
     if not env_path.exists():
         if example_path.exists():
             console.print(
                 "[yellow]⚠  No .env found. Copy .env.example to .env and add your API keys.[/yellow]"
             )
-            console.print(f"   [dim]cp .env.example .env && nano .env[/dim]\n")
+            console.print("   [dim]cp .env.example .env && nano .env[/dim]\n")
         else:
-            console.print("[red]No .env or .env.example found. Make sure you're in the hivemind/ directory.[/red]")
+            console.print("[red]No .env or .env.example found. Run from the hivemind/ directory.[/red]")
         sys.exit(1)
 
 
-async def run_task(task: str, max_depth: int, max_agents: int, min_complexity: int):
-    from agents.node import AgentNode
+async def run_task(task: str, max_agents: int):
+    from agents.node import AgentNode, AgentRole
     import agents.node as _node_module
-    # Reset global agent state between runs
-    _node_module._agent_registry = {}
-    _node_module._agent_count = 0
-
-    from ui.display import run_with_ui
     from core.providers import get_pool
 
-    # Validate providers loaded
+    _node_module._agent_registry.clear()
+
     pool = get_pool()
     console.print(
-        f"[dim]Loaded {len(pool.providers)} provider(s): "
-        f"{', '.join(p.name for p in pool.providers)}[/dim]\n"
+        f"[dim]Providers: {', '.join(f'{p.name}({p.model_class.value})' for p in pool.tiers)}[/dim]\n"
     )
 
     semaphore = asyncio.Semaphore(max_agents)
+    root = AgentNode(task=task, depth=0, role=AgentRole.ORCHESTRATOR)
 
-    root = AgentNode(
-        task=task,
-        depth=0,
-        max_depth=max_depth,
-        min_complexity=min_complexity,
-    )
+    await root.run(semaphore)
 
-    clarification = await run_with_ui(root, task, semaphore)
-
-    # Show usage summary
+    # Stats
     pool = get_pool()
     console.print()
     for ps in pool.stats():
-        total = ps['calls'] + ps['errors']
-        console.print(
-            f"[dim]  {ps['name'].lower():<10} {ps['calls']} calls  {ps['errors']} errors  "
-            f"({total} requests this session)[/dim]"
-        )
+        if ps["calls"] or ps["errors"]:
+            console.print(
+                f"[dim]  {ps['name'].lower():<18} {ps['calls']} calls  {ps['errors']} errors[/dim]"
+            )
+
+    all_nodes = root.all_nodes()
     console.print(
-        f"[dim]  Note: Gemini Flash Lite free tier ~1500 req/day · Groq free tier ~14400 req/day[/dim]\n"
+        f"[dim]  Total agents: {len(all_nodes)}  |  Time: {root.elapsed():.1f}s[/dim]\n"
     )
 
-    # Print final result
-    console.print()
-    if clarification:
+    # Result
+    if root.error == "needs_clarification":
         console.print(Panel(
-            clarification,
+            root.result,
             title="[bold yellow]⚠ Needs Clarification[/bold yellow]",
             border_style="yellow",
+            padding=(1, 2),
+        ))
+    elif root.result.startswith("[ERROR]"):
+        console.print(Panel(
+            root.result,
+            title="[bold red]✗ Error[/bold red]",
+            border_style="red",
             padding=(1, 2),
         ))
     else:
         console.print(Panel(
             root.result,
-            title="[bold green]✓ Final Answer[/bold green]",
+            title="[bold green]✓ Result[/bold green]",
             border_style="green",
             padding=(1, 2),
         ))
 
-    # Show tree stats
-    all_nodes = root.all_nodes()
-    console.print(
-        f"\n[dim]Total agents: {len(all_nodes)}  |  "
-        f"Time: {root.elapsed():.1f}s  |  "
-        f"API calls: {sum(p.calls for p in pool.providers)}[/dim]\n"
-    )
+    if root.files_written:
+        console.print("[dim]Files written:[/dim]")
+        for f in root.files_written:
+            console.print(f"  [green]✓[/green] {f}")
 
 
 def main():
@@ -118,35 +112,15 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="hivemind",
-        description="Recursive multi-agent task solver",
-        add_help=True,
+        description="HiveMind v2 — recursive multi-agent task solver",
     )
-    parser.add_argument(
-        "task",
-        nargs="?",
-        help="Task to solve (if omitted, you'll be prompted)",
-    )
-    parser.add_argument(
-        "--max-depth", type=int,
-        default=int(os.getenv("MAX_DEPTH", "6")),
-        help="Max recursion depth (default: 6)",
-    )
+    parser.add_argument("task", nargs="?", help="Task to solve (omit for interactive)")
     parser.add_argument(
         "--max-agents", type=int,
         default=int(os.getenv("MAX_PARALLEL_AGENTS", "8")),
         help="Max concurrent agents (default: 8)",
     )
-    parser.add_argument(
-        "--min-complexity", type=int,
-        default=int(os.getenv("MIN_COMPLEXITY_TO_SPLIT", "3")),
-        help="Complexity threshold to split (1-10, default: 3)",
-    )
-    parser.add_argument(
-        "--interactive", "-i",
-        action="store_true",
-        help="Keep asking for tasks after each run",
-    )
-
+    parser.add_argument("--interactive", "-i", action="store_true")
     args = parser.parse_args()
 
     async def loop():
@@ -159,15 +133,8 @@ def main():
                 task = Prompt.ask("[bold cyan]⬡[/bold cyan] Task")
                 if not task.strip():
                     break
-
             first = False
-            await run_task(
-                task=task.strip(),
-                max_depth=args.max_depth,
-                max_agents=args.max_agents,
-                min_complexity=args.min_complexity,
-            )
-
+            await run_task(task=task.strip(), max_agents=args.max_agents)
             if not args.interactive:
                 break
 
