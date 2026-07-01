@@ -123,7 +123,7 @@ _HEADING_FENCED = re.compile(
     r"#{1,4}\s+([^\n`]+\.[a-zA-Z0-9]+)\s*\n```[\w]*\n(.*?)```",
     re.DOTALL,
 )
-_FENCED_LANG = re.compile(r"```(\w+)\n(.*?)```", re.DOTALL)
+_FENCED_LANG = re.compile(r"```(\w[^\n`]*)\n(.*?)```", re.DOTALL)
 _LANG_EXT = {
     "python": "py", "py": "py", "javascript": "js", "js": "js",
     "typescript": "ts", "ts": "ts", "bash": "sh", "sh": "sh",
@@ -190,8 +190,10 @@ def _extract_and_write_files(result: str, output_dir: pathlib.Path,
     # Pattern 3: any fenced block by language
     if not written:
         slug = re.sub(r"[^a-z0-9]+", "_", root_task.lower())[:32].strip("_")
-        for lang, code in _FENCED_LANG.findall(result):
-            ext = _LANG_EXT.get(lang.lower())
+        for lang_tag, code in _FENCED_LANG.findall(result):
+            # lang_tag may be "python" or "python chess.py" — extract just the language word
+            lang = lang_tag.split()[0].lower()
+            ext = _LANG_EXT.get(lang)
             if not ext:
                 continue
             if explicit_path and explicit_path.suffix.lstrip(".") == ext:
@@ -288,17 +290,17 @@ For "complex":
     "output_shape": "<single_file|multi_file|document|analysis>",
     "file_owners": [
       {
-        "domain": "Short label for this owner's area (e.g. 'move_generation')",
-        "task": "What this file-owner agent is responsible for producing.",
+        "domain": "short_label",
+        "task": "What this domain covers.",
         "workers": [
-          {
-            "task": "Specific function/section this worker writes.",
-            "model_class": "worker"
-          }
+          {"task": "def fn_name(params) -> type: one sentence. Calls: [other_fn if needed].", "model_class": "worker"}
         ]
       }
-    ]
+    ],
+    "interfaces": "KEEP UNDER 200 CHARS. Key shared types only, no newlines. E.g.: 'board:list[list[str|None]] 8x8 board[rank][file] rank0=top, piece=2char type+color e.g.k+/p- piece[0]=type piece[1]=color'. Omit for prose."
   }
+  IMPORTANT: output_shape and file_owners MUST appear before interfaces in the JSON.
+  The interfaces field is lowest priority — complete the plan first, add interfaces last.
 
 output_shape guide:
   single_file  — all output assembles into one file (e.g. a chess game, a web page)
@@ -306,14 +308,30 @@ output_shape guide:
   document     — prose output (report, README, guide, essay)
   analysis     — structured analysis/conclusions (no filler prose)
 
-Rules for "complex":
+Rules for "complex" code tasks:
   • Minimum 2 file_owners, maximum 6.
-  • Each file_owner owns one logical subsystem and has 1-4 workers.
-  • Workers write specific, self-contained functions or sections — small enough
-    to complete in one pass (~50-150 lines of code or equivalent prose).
+  • Each file_owner owns one logical subsystem and has 2-6 workers.
+  • EACH WORKER WRITES EXACTLY ONE FUNCTION — the task field must contain the exact def signature.
+  • Prefer MORE workers with SMALLER scope over fewer workers with larger scope.
+    A worker that writes ~10-30 lines is far more reliable than one writing 80+ lines.
+    Split generously: one function per worker, always.
+  • Function names must be unique across ALL workers in the entire plan — no duplicates.
+  • All workers must use the exact types from the interfaces contract.
+  • Tell workers what functions from other workers they may call, e.g.:
+    "Call get_piece_moves(board, file, rank, en_passant) — do NOT reimplement it."
+  • One worker per file_owner must implement the entry point (main/run/game_loop) that calls the others by their exact function names.
   • file_owners run in parallel; workers within each file_owner run in parallel.
-  • For single_file output: file_owners each own a logical section/module of the
-    final file. The assembly happens at merge time — workers just write their piece.
+  • For single_file output: the assembly agent stitches all worker functions into one file.
+
+Worker model_class assignment — choose based on function complexity:
+  "worker"  — simple, well-defined functions: data init, simple lookups, parsing,
+               short math, rendering. Expected output: ~10-30 lines.
+               Examples: initialize_board, parse_move_input, find_king, render_board.
+  "analyst" — complex functions requiring deep logic, multiple control paths, or
+               coordination across many rules. Expected output: 40-100+ lines.
+               Examples: get_piece_moves (all piece types), apply_move (castling+en passant+promotion),
+               get_legal_moves (filter + simulate), run_game / main (full loop wiring everything).
+  Rule: if the function must handle 3+ distinct cases or call 3+ other functions, use "analyst".
 """
 
 
@@ -332,16 +350,36 @@ def _safe_output_shape(value: str) -> OutputShape:
         return OutputShape.DOCUMENT
 
 
-async def _orchestrate(task: str) -> dict:
-    raw = await chat(
-        [{"role": "user", "content": f"Task: {task}"}],
-        system=_CLASSIFY_SYSTEM,
-        temperature=0.2,
-        max_tokens=1500,
-        model_class=ModelClass.ORCHESTRATOR,
-    )
+def _repair_json_strings(text: str) -> str:
+    """Escape literal newlines/tabs inside JSON string values (LLM often emits them)."""
+    result = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            result.append(ch)
+            escaped = False
+        elif ch == "\\" and in_string:
+            result.append(ch)
+            escaped = True
+        elif ch == '"':
+            in_string = not in_string
+            result.append(ch)
+        elif in_string and ch == "\n":
+            result.append("\\n")
+        elif in_string and ch == "\t":
+            result.append("\\t")
+        elif in_string and ch == "\r":
+            result.append("\\r")
+        else:
+            result.append(ch)
+    return "".join(result)
 
+
+def _parse_orchestrate_raw(raw: str) -> dict | None:
     clean = raw.strip()
+    # Strip <think>...</think> blocks (Qwen, DeepSeek reasoning models)
+    clean = re.sub(r"<think>.*?</think>", "", clean, flags=re.DOTALL).strip()
     if clean.startswith("```"):
         lines = clean.split("\n")
         inner = []
@@ -350,17 +388,82 @@ async def _orchestrate(task: str) -> dict:
                 break
             inner.append(line)
         clean = "\n".join(inner).strip()
-
     start = clean.find("{")
     end   = clean.rfind("}")
     if start != -1 and end != -1:
         clean = clean[start:end + 1]
 
+    # First attempt: direct parse
     try:
-        result = json.loads(clean)
-    except json.JSONDecodeError as e:
-        _debug_log(f"[orchestrate] JSON parse failed: {e}\nRaw: {raw[:300]}")
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+
+    # Second attempt: repair literal newlines/tabs inside string values
+    try:
+        return json.loads(_repair_json_strings(clean))
+    except json.JSONDecodeError:
+        pass
+
+    # Truncated JSON recovery: the plan was cut mid-string (common when interfaces
+    # field is verbose). Try to salvage any complete file_owner objects already parsed.
+    try:
+        start = clean.find("{")
+        if start == -1:
+            return None
+        fragment = clean[start:]
+        # Collect complete "workers" arrays by finding file_owner blocks that closed properly
+        owners = []
+        for m in re.finditer(r'\{\s*"domain"\s*:\s*"([^"]+)".*?"workers"\s*:\s*(\[(?:[^\[\]]|\[[^\[\]]*\])*\])', fragment, re.DOTALL):
+            try:
+                workers_raw = json.loads(m.group(2))
+                owners.append({"domain": m.group(1), "task": m.group(1), "workers": workers_raw})
+            except json.JSONDecodeError:
+                pass
+        # Extract route/shape/interfaces via regex
+        route_m = re.search(r'"route"\s*:\s*"(\w+)"', fragment)
+        shape_m = re.search(r'"output_shape"\s*:\s*"(\w+)"', fragment)
+        iface_m = re.search(r'"interfaces"\s*:\s*"((?:[^"\\]|\\.)*)"', fragment)
+        route = route_m.group(1) if route_m else "simple"
+        shape = shape_m.group(1) if shape_m else "single_file"
+        if iface_m:
+            try:
+                iface = iface_m.group(1).encode("utf-8").decode("unicode_escape")
+            except (UnicodeDecodeError, ValueError):
+                iface = iface_m.group(1)  # keep raw on decode failure
+        else:
+            iface = ""
+        if owners and route == "complex":
+            _debug_log(f"[orchestrate] truncated JSON recovered: {len(owners)} owners")
+            return {"route": route, "output_shape": shape, "interfaces": iface, "file_owners": owners}
+    except Exception:
+        pass
+    return None
+
+
+async def _orchestrate(task: str) -> dict:
+    result = None
+    for attempt in range(2):
+        raw = await chat(
+            [{"role": "user", "content": f"Task: {task}"}],
+            system=_CLASSIFY_SYSTEM,
+            temperature=0.2,
+            max_tokens=8000,
+            model_class=ModelClass.ORCHESTRATOR,
+        )
+        result = _parse_orchestrate_raw(raw)
+        if result is not None:
+            break
+        _debug_log(f"[orchestrate] JSON parse failed (attempt {attempt+1})\nRaw: {raw[:300]}")
+
+    if result is None:
         result = {"route": "simple", "model_class": "worker"}
+
+    # Sanity: if we got file_owners but interfaces is absurdly long, trim it
+    # so it doesn't blow worker prompts
+    if "interfaces" in result and len(result["interfaces"]) > 400:
+        result["interfaces"] = result["interfaces"][:400]
+        _debug_log("[orchestrate] interfaces field trimmed to 400 chars")
 
     _debug_log(
         f"[orchestrate] → {result.get('route')} | "
@@ -375,17 +478,39 @@ async def _orchestrate(task: str) -> dict:
 def _merge_system(shape: OutputShape, is_file_owner: bool = False) -> tuple[str, int]:
     """Return (system_prompt, max_tokens) tuned to the output shape."""
     if shape == OutputShape.SINGLE_FILE:
-        prompt = (
-            "You are HiveMind's assembly agent. Combine the worker outputs into "
-            "one complete, working file.\n"
-            "RULES:\n"
-            "1. Assemble ALL worker code into a single fenced block with the filename:\n"
-            "   ```python chess.py\n   <full combined code>\n   ```\n"
-            "2. Preserve every function and class VERBATIM — do not rewrite logic.\n"
-            "3. Order sections logically (imports → data structures → functions → main).\n"
-            "4. Remove duplicate imports or definitions — keep one copy.\n"
-            "5. End with a brief '## How to run' section."
-        )
+        if is_file_owner:
+            prompt = (
+                "You are HiveMind's domain assembler. Each worker wrote exactly one function. "
+                "Your job is to stitch them into one clean code block AND validate the result.\n\n"
+                "ASSEMBLY RULES:\n"
+                "1. Combine ALL worker functions into one fenced code block:\n"
+                "   ```python <domain_name>.py\n   <stitched code>\n   ```\n"
+                "2. Deduplicate imports — one copy of each at the top.\n"
+                "3. Order: imports → constants → functions (dependencies before callers).\n"
+                "4. Preserve all logic verbatim — do NOT rewrite, summarize, or paraphrase.\n"
+                "5. Fix ONLY: broken for/if/def statements, unclosed brackets, truncated lines.\n"
+                "6. If two workers defined the same function name, keep the more complete one.\n\n"
+                "VALIDATION — before outputting, check the assembled code for these bugs:\n"
+                "A. Fake imports: remove any `from <name> import` where <name> is NOT a stdlib "
+                "   or third-party package — these are worker artefacts where the worker invented "
+                "   a module name for functions that are already defined in this same file.\n"
+                "CRITICAL: Your entire response must be ONE fenced code block and nothing else.\n"
+                "No reasoning, no explanation, no steps, no commentary before or after the block.\n"
+                "No stub placeholders like `def fn(...) ...` — only complete, runnable function bodies.\n"
+                "Start your response with ``` and end it with ```."
+            )
+        else:
+            prompt = (
+                "You are HiveMind's assembly agent. Combine the worker outputs into "
+                "one complete, working file.\n"
+                "RULES:\n"
+                "1. Assemble ALL worker code into a single fenced block with the filename:\n"
+                "   ```python chess.py\n   <full combined code>\n   ```\n"
+                "2. Preserve every function and class VERBATIM — do not rewrite logic.\n"
+                "3. Order sections logically (imports → data structures → functions → main).\n"
+                "4. Remove duplicate imports or definitions — keep one copy.\n"
+                "5. End with a brief '## How to run' section."
+            )
         tokens = 6000
     elif shape == OutputShape.MULTI_FILE:
         prompt = (
@@ -484,6 +609,7 @@ class AgentNode:
     # Transient: worker spec dicts passed from orchestrator to file_owner at construction.
     # Not propagated further — consumed in _file_owner_run.
     _worker_specs: list[dict] = field(default_factory=list)
+    _interfaces: str = ""
 
     def __post_init__(self):
         _agent_registry[self.agent_id] = self
@@ -577,6 +703,7 @@ class AgentNode:
             return
 
         self.output_shape = _safe_output_shape(plan.get("output_shape", "document"))
+        self._interfaces = plan.get("interfaces", "") or ""
         self.is_project = self.output_shape in (OutputShape.SINGLE_FILE, OutputShape.MULTI_FILE)
         if not self.is_project:
             self.is_project = bool(_TASK_PATH_RE.search(self.root_task))
@@ -619,6 +746,7 @@ class AgentNode:
                 on_shell_run=self.on_shell_run,
                 # carry worker specs so file_owner can spawn them
                 _worker_specs=fo.get("workers", []),
+                _interfaces=self._interfaces,
             )
             for i, fo in enumerate(file_owners)
         ]
@@ -684,12 +812,14 @@ class AgentNode:
                 output_dir=self.output_dir,
                 sudo_callback=self.sudo_callback,
                 on_shell_run=self.on_shell_run,
+                _interfaces=self._interfaces,
             )
             for i, ws in enumerate(worker_specs)
         ]
         self._emit()
         _debug_log(
-            f"[{self.task_id}] ({self.domain}) spawning {len(self.children)} workers"
+            f"[{self.task_id}] ({self.domain}) spawning {len(self.children)} workers: "
+            + ", ".join(f"{c.task_id}({c.model_class.value})" for c in self.children)
         )
 
         # Workers run in parallel
@@ -702,6 +832,16 @@ class AgentNode:
             model_class=ModelClass.ANALYST,
             is_file_owner=True,
         )
+        # Sanity-check analyst result quality; fall back to raw worker concat if broken.
+        _unk_count = self.result.count("<unk>")
+        _unk_ratio = _unk_count / max(len(self.result), 1)
+        _tq_dq = self.result.count('"""')
+        _tq_sq = self.result.count("'''")
+        _analyst_bad = (_unk_ratio > 0.01 or _unk_count > 5
+                        or _tq_dq % 2 != 0 or _tq_sq % 2 != 0)
+        if _analyst_bad:
+            _debug_log(f"[{self.task_id}] analyst result invalid (unk={_unk_ratio:.3f}, tq={_tq_count}), using raw worker concat")
+            self.result = "\n\n".join(c.result for c in self.children if c.result)
         if self.workspace_path:
             _append_workspace(self.workspace_path, f"{self.task_id}({self.domain})", self.result)
         self.status = AgentStatus.DONE
@@ -758,14 +898,52 @@ class AgentNode:
 
         domain_context = f"\nYou are working on domain: {self.domain}." if self.domain else ""
 
+        # Workers on single-file code tasks write one focused piece;
+        # the file_owner analyst stitches all workers' output into the final file.
+        if (self.role == AgentRole.WORKER
+                and self.output_shape in (OutputShape.SINGLE_FILE, OutputShape.MULTI_FILE)
+                and self.is_project):
+            if self._interfaces:
+                iface_note = (
+                    "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "ENFORCED CONTRACT — your code MUST satisfy these:\n"
+                    f"{self._interfaces}\n"
+                    "Any variable, type, or value that contradicts the above is a bug.\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                )
+            else:
+                iface_note = ""
+            worker_scope = (
+                "\n\nYOU ARE A SINGLE-FUNCTION WORKER. Your only job is to implement the ONE "
+                "function whose exact signature is stated in the task. Nothing else.\n\n"
+                "STRICT RULES:\n"
+                "• Write ONLY that one function — its def line, body, and any stdlib imports it needs\n"
+                "• Use the EXACT function name, parameter names, and return type from the task signature\n"
+                "• The implementation must be complete — no `pass`, no `...`, no placeholders\n"
+                "• Do NOT write a second function, a class, a main block, or example usage\n"
+                "• Do NOT reimplement functions other workers own — call them by their exact name\n"
+                "• If your function needs a small helper, define it as a nested def INSIDE your function\n"
+                "• Do NOT add `from <module> import` for things defined in this same project — "
+                "all functions are in one file and are already in scope\n"
+                "• Wrap your output in ONE fenced block: ```python\\n<your function>\\n```"
+                + iface_note
+            )
+        else:
+            worker_scope = ""
+
         system = (
             "You are a HiveMind agent. Solve the task completely and directly. "
             "Do not ask clarifying questions — do your best with the information given."
             + domain_context
+            + worker_scope
             + file_hint
         )
-        # Workers on code/file tasks need more room than prose agents
-        _max_tok = 3500 if self.role == AgentRole.WORKER else 2048
+        # Scale token budget by role + model class
+        # analyst-class workers handle complex functions and need more room
+        if self.role == AgentRole.WORKER:
+            _max_tok = 8000 if self.model_class == ModelClass.ANALYST else 6000
+        else:
+            _max_tok = 2048
         return await chat(
             [{"role": "user", "content": f"Task: {self.task}{ws_context}"}],
             system=system,
@@ -828,11 +1006,18 @@ class AgentNode:
     # ── Merge (shape-aware, role-aware) ───────────────────────────────────────
 
     async def _merge(self, model_class: ModelClass, is_file_owner: bool = False) -> str:
-        # For code assembly (single_file/multi_file) we need the actual code verbatim.
-        # For prose shapes, cap tightly to stay under Groq's 6K token body limit.
-        # single_file with ≤4 workers: 1500 chars each ≈ 6K total (just within limit)
-        # For larger trees, Gemini ORC (no body limit) handles the merge.
-        if self.output_shape in (OutputShape.SINGLE_FILE, OutputShape.MULTI_FILE):
+        # single_file root merge: extract code from each file_owner result and
+        # concatenate in Python — no LLM call for assembly avoids 6K token / connection limits.
+        if (self.output_shape == OutputShape.SINGLE_FILE
+                and not is_file_owner
+                and self.depth == 0):
+            return self._concatenate_single_file()
+
+        # Root orchestrator merges hit Groq compound (6K body limit) — keep tight.
+        # File_owner ANALYST merges go to llama-4-scout/nemotron (131K+ context) — give full content.
+        if is_file_owner:
+            MAX_CHILD_CHARS = 8000
+        elif self.output_shape in (OutputShape.SINGLE_FILE, OutputShape.MULTI_FILE):
             MAX_CHILD_CHARS = 1500
         else:
             MAX_CHILD_CHARS = 800
@@ -849,13 +1034,14 @@ class AgentNode:
                 ws_context = f"\n\nWorkspace:\n{existing[-1500:]}"
 
         system, max_tokens = _merge_system(self.output_shape, is_file_owner=is_file_owner)
-
         domain_note = f"\nYou are merging output for domain: {self.domain}." if self.domain else ""
+        iface_note = f"\nShared interface contract: {self._interfaces}" if self._interfaces and is_file_owner else ""
 
         return await chat(
             [{"role": "user", "content": (
                 f"Original task: {self.task}\n"
                 + domain_note
+                + iface_note
                 + f"\n\nSub-agent outputs:\n{child_results}{ws_context}\n\n"
                 "Produce a unified, complete output."
             )}],
@@ -864,6 +1050,165 @@ class AgentNode:
             max_tokens=max_tokens,
             model_class=model_class,
         )
+
+    def _concatenate_single_file(self) -> str:
+        """
+        Pure-Python assembly for single_file tasks.
+        Extracts code from each file_owner's result (strips fences, deduplicates
+        imports) and concatenates into one fenced block. No LLM call needed.
+        """
+        import_lines: list[str] = []
+        body_sections: list[str] = []
+
+        # Shell-like langs to skip when extracting code bodies
+        _SKIP_LANGS = {"bash", "sh", "shell", "zsh", "console", "text", ""}
+
+        for child in self.children:
+            raw = child.result or ""
+            # If result contains a fenced block, discard everything outside the fences.
+            # This strips analyst prose preambles and reasoning chains reliably.
+            _first_fence = raw.find("```")
+            _last_fence  = raw.rfind("```")
+            if _first_fence != -1 and _last_fence != _first_fence:
+                raw = raw[_first_fence:_last_fence + 3]
+            # Extract fenced code blocks — skip shell/prose blocks, take largest code block
+            fenced_blocks = _FENCED_LANG.findall(raw)
+            code_blocks = [
+                body.strip()
+                for lang_tag, body in fenced_blocks
+                if lang_tag.split()[0].lower() not in _SKIP_LANGS and body.strip()
+            ]
+            if code_blocks:
+                # Join all code blocks; if one block is ≥ 80% of total, use it alone
+                # to avoid duplicating import-only helper blocks from the "How to run" section
+                total = sum(len(b) for b in code_blocks)
+                dominant = [b for b in code_blocks if len(b) >= 0.8 * total]
+                code = dominant[0] if dominant else "\n\n".join(code_blocks)
+            else:
+                # No fenced code block at all — analyst output pure prose (reasoning essay,
+                # no code). Try to extract def blocks directly from raw text as last resort.
+                def_blocks = re.findall(r'^(def \w+.*?)(?=\ndef |\Z)', raw, re.DOTALL | re.MULTILINE)
+                if def_blocks:
+                    code = "\n\n".join(b.strip() for b in def_blocks)
+                else:
+                    # Pure prose, no recoverable code — skip this domain entirely
+                    _debug_log(f"[{self.task_id}] skipping {child.domain}: no code block found in analyst output")
+                    continue
+
+            if not code:
+                continue
+
+            # Strip stub placeholder lines like `def fn(...) ...` or `def fn(...):\n    ...`
+            # These are analyst summaries, not real code
+            code = re.sub(r'^def [^\n]+\.\.\.[^\n]*\n?', '', code, flags=re.MULTILINE)
+            # Two-line stubs: `def fn(...):\n    ...\n`
+            code = re.sub(r'^(def [^\n]+:\n)\s*\.\.\.\s*\n?', '', code, flags=re.MULTILINE)
+
+            # Strip trailing lines that look truncated (open bracket, trailing comma/operator)
+            code_lines = code.rstrip().splitlines()
+            # Strip trailing lines that look truncated: open bracket, unclosed string,
+            # trailing comma/operator, or imbalanced quotes.
+            while code_lines:
+                last = code_lines[-1].rstrip()
+                # Open bracket / operator at end of line
+                if last.endswith(("(", "[", "{", ",", "\\", "+", "-", "*", "/", "%",
+                                   "=", "==", "!=", "<=", ">=", "<", ">",
+                                   "and", "or", "not", "in", "is", ":", "->")):
+                    code_lines.pop()
+                    continue
+                # Unclosed string literal: odd number of unescaped quotes
+                sq = last.count("'") - last.count("\\'")
+                dq = last.count('"') - last.count('\\"')
+                if sq % 2 != 0 or dq % 2 != 0:
+                    code_lines.pop()
+                    continue
+                break
+            code = "\n".join(code_lines)
+
+            # Split imports from body
+            lines = code.splitlines()
+            imp, body = [], []
+            in_body = False
+            for line in lines:
+                stripped = line.strip()
+                if not in_body and (
+                    stripped.startswith("import ")
+                    or stripped.startswith("from ")
+                    or stripped == ""
+                ):
+                    imp.append(line)
+                else:
+                    in_body = True
+                    body.append(line)
+
+            # Validate: skip sections with unclosed triple-quoted strings
+            try:
+                import ast as _ast
+                _ast.parse(code)
+                _code_valid = True
+            except SyntaxError:
+                # Try to parse just enough to detect unclosed docstrings
+                _tq_dq = code.count('"""')
+                _tq_sq = code.count("'''")
+                _code_valid = (_tq_dq % 2 == 0 and _tq_sq % 2 == 0)
+                if not _code_valid:
+                    _debug_log(f"[{self.task_id}] skipping {child.domain}: unclosed triple-quote string")
+
+            if _code_valid:
+                import_lines.extend(imp)
+            if body and _code_valid:
+                body_sections.append(f"# ── {child.domain} ──\n" + "\n".join(body))
+
+        # Strip fake internal imports: `from <unknown_module> import` where the module
+        # is not a known stdlib/third-party package — these are worker artefacts where
+        # the worker invented a module name for functions that live in the same file.
+        _KNOWN_PKGS = {
+            "os", "sys", "re", "io", "math", "json", "copy", "time", "random",
+            "string", "typing", "collections", "itertools", "functools", "pathlib",
+            "dataclasses", "enum", "abc", "ast", "textwrap", "struct", "hashlib",
+            "datetime", "threading", "asyncio", "subprocess", "shutil", "tempfile",
+            "unittest", "logging", "warnings", "contextlib", "inspect", "types",
+            "heapq", "bisect", "queue", "array", "weakref", "gc", "platform",
+            "numpy", "np", "pandas", "pd", "pygame", "flask", "django", "requests",
+            "PIL", "cv2", "sklearn", "torch", "tensorflow", "scipy", "matplotlib",
+        }
+        _fake_import_re = re.compile(r'^from\s+(\w+)\s+import', re.MULTILINE)
+
+        def _is_real_import(line: str) -> bool:
+            m = _fake_import_re.match(line.strip())
+            if not m:
+                return True  # plain `import x` or blank — keep
+            mod = m.group(1).split(".")[0]
+            return mod in _KNOWN_PKGS
+
+        # Deduplicate imports while preserving order
+        seen_imports: set[str] = set()
+        deduped_imports: list[str] = []
+        for line in import_lines:
+            key = line.strip()
+            if key and key not in seen_imports and _is_real_import(line):
+                seen_imports.add(key)
+                deduped_imports.append(line)
+
+        # Infer filename and language from task text and dominant lang in blocks
+        slug = re.sub(r"[^a-z0-9]+", "_", self.root_task.lower())[:24].strip("_")
+        task_lower = self.root_task.lower()
+        if any(w in task_lower for w in ("webpage", "html", "website", "web page")):
+            ext, lang = "html", "html"
+        elif any(w in task_lower for w in ("javascript", " js ")):
+            ext, lang = "js", "javascript"
+        else:
+            ext, lang = "py", "python"
+        fname = f"{slug}.{ext}"
+
+        if ext == "py":
+            assembled = "\n".join(deduped_imports) + "\n\n" + "\n\n".join(body_sections)
+        else:
+            # For non-Python, concatenate all sections without import dedup
+            assembled = "\n\n".join(body_sections)
+
+        _debug_log(f"[{self.task_id}] concatenation ({lang}): {len(assembled)} chars → {fname}")
+        return f"```{lang} {fname}\n{assembled}\n```"
 
     # ── Tree helpers ──────────────────────────────────────────────────────────
 

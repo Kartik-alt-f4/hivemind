@@ -249,7 +249,7 @@ class ProviderPool:
         """
         for candidate_class in _ESCALATION[mc]:
             available = [p for p in self._by_class[candidate_class]
-                         if not p.all_exhausted()]
+                         if not p.all_exhausted() and p.weight > 0]
             if not available:
                 continue
             if len(available) == 1:
@@ -270,7 +270,7 @@ class ProviderPool:
 
     def any_available(self) -> bool:
         return any(
-            not p.all_exhausted()
+            not p.all_exhausted() and p.weight > 0
             for providers in self._by_class.values()
             for p in providers
         )
